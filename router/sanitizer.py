@@ -75,7 +75,15 @@ def sanitize_file_content(content: str, file_path: str) -> tuple[str, bool]:
     """
     Pipeline completo para contenido de archivo.
     Returns: (texto_limpio, era_html)
+
+    La extensión manda sobre la heurística: un archivo de código NUNCA se
+    procesa como HTML. Un scraper, un template o un test con fixtures contienen
+    literales '<html>'/'<div>' y la heurística los daba por página web,
+    destruyendo el código (tags borrados). La fidelidad exacta es la promesa
+    central: ante la duda, no tocar.
     """
+    if is_code_file(file_path):
+        return clean_text(content, is_code=True), False
     if looks_like_html(content):
         return strip_html(content), True
-    return clean_text(content, is_code=is_code_file(file_path)), False
+    return clean_text(content, is_code=False), False

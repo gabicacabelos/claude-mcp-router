@@ -187,6 +187,40 @@ def test_clean_text_does_not_touch_fenced_code():
     assert "mas prosa" in out
 
 
+# ─── sanitizer.sanitize_file_content: la extensión manda sobre la heurística ──
+
+def test_code_file_with_html_literals_is_never_stripped():
+    """
+    Regresión: un .py con literales HTML (scraper, template, fixtures) se daba
+    por página web y se le borraban los tags → código corrupto. La fidelidad
+    exacta es la promesa central del producto.
+    """
+    from router.sanitizer import sanitize_file_content
+    code = (
+        'import re\n'
+        '_RE = re.compile(r"<!DOCTYPE\\s+html|<html\\b|<body\\b|<head\\b", re.I)\n'
+        'TEMPLATE = "<div class=\'card\'><p>hola</p></div>"\n'
+        'def render(): return TEMPLATE\n'
+    )
+    clean, was_html = sanitize_file_content(code, "scraper.py")
+
+    assert was_html is False, "un archivo de código nunca debe procesarse como HTML"
+    assert "<html\\b" in clean and "<body\\b" in clean, "el regex debe sobrevivir intacto"
+    assert "<div class='card'><p>hola</p></div>" in clean, "el template debe sobrevivir intacto"
+    assert clean.strip() == code.strip(), "cero pérdida: el código vuelve tal cual"
+
+
+def test_real_html_file_is_still_stripped():
+    """El arreglo no debe romper el caso legítimo: HTML de verdad sí se limpia."""
+    from router.sanitizer import sanitize_file_content
+    html = "<html><body><style>.x{color:red}</style><script>evil()</script><p>texto visible</p></body></html>"
+    clean, was_html = sanitize_file_content(html, "page.html")
+
+    assert was_html is True
+    assert "texto visible" in clean
+    assert "evil()" not in clean and "color:red" not in clean
+
+
 def test_clean_text_normalizes_blank_lines_and_crlf():
     text = "a\r\n\r\n\r\n\r\nb"
     out = clean_text(text)
