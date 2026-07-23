@@ -11,7 +11,7 @@ graph TD
     C[Claude Cowork] --> M
     D[Claude Design] --> M
 
-    M[("claude-continuity-mcp<br/>━━━━━━━━━━━━━<br/>smart_read · checkpoint<br/>inbox · SQLite ledger")] --> P[(Your project<br/>on disk)]
+    M[("claude-continuity-mcp<br/>━━━━━━━━━━━━━<br/>smart_read · checkpoint · inbox<br/>rules · SQLite ledger")] --> P[(Your project<br/>on disk)]
 
     style M fill:#1a1a2e,stroke:#00c8e8,stroke-width:2px,color:#fff
     style P fill:#0d0d1a,stroke:#666,stroke-width:1px,color:#ccc
@@ -38,7 +38,7 @@ Claude is amnesiac across sessions and blind across clients: what you read in Cl
 
 > **Note:** bulk processing on free models (formerly `router_bulk_process`) was split into its own repo, [`individra-bulk-offload`](https://github.com/gabicacabelos/individra-bulk-offload), because it's a different product: it depended on external services that diluted this 100%-local core.
 
-## The 4 tools
+## The 5 tools
 
 ### `router_smart_read` — Surgical reading with memory (local, $0, no APIs)
 
@@ -115,6 +115,19 @@ And the other way around: Claude Design can leave `code` an order with the final
 
 The headline metric is `tokens_kept_out_of_context`: tokens from the original sources that **didn't** enter Claude's context window. It also reports reads, memory hits (unchanged/diff), ledger state, and pending inbox orders. `deep=true` adds local diagnostics (fastembed/python).
 
+### `router_rules` — Permanent project rules, with provenance
+
+```
+rules(action="add", project_dir="/proj", text="never use Redux", from_client="code")
+rules(action="promote", project_dir="/proj", checkpoint="arch-decisions")  # a checkpoint decision → permanent rule
+```
+
+Distinct from the *task state* a checkpoint captures, a rule is a **permanent** project decision (`"never use Redux"`, `"tests go in tests/"`). Each one carries provenance: **who** decided it (client/human), **when**, and **which checkpoint** it came from. Rules live in `.claude-continuity-rules.json` at the project root — git-friendly, hand-editable, travels with the repo, and survives any change to Anthropic's APIs.
+
+- **Deterministic:** the rule is literal text written by the human or promoted from a checkpoint's `decisions` — never a lossy LLM summary.
+- **Zero-friction distribution:** you don't call the tool to *read* rules — they're injected as `project_rules` into `smart_read` and `resume` payloads for files in that project (piggybacking on calls that already happen).
+- **Doesn't fight `CLAUDE.md`, feeds it:** `sync_to_claudemd=true` writes the rules into a delimited section (`<!-- INDIVIDRA RULES START/END -->`) of the project's `CLAUDE.md`, leaving your own content untouched — so Claude Code's native memory gets them too.
+
 ## Real savings (honest numbers)
 
 | Scenario | Savings | Fidelity |
@@ -136,7 +149,7 @@ pip install -r requirements.txt
 # Optional (local semantic ranking for smart_read): pip install fastembed
 ```
 
-No API key or `.env` file needed: all four tools are 100% local.
+No API key or `.env` file needed: all five tools are 100% local.
 
 ### Registering it across all your Claude sessions
 
@@ -191,6 +204,7 @@ smart_read ──▶ sanitizer (HTML/text, local) ──▶ ledger (have I seen 
                           └─ pure-Python BM25 (fallback, 0 deps)
 checkpoint ──▶ checkpoints/*.json (human-readable/editable) + hash verification on resume
 inbox ──────▶ shared SQLite queue (orders between Cowork/Code/Desktop/Design + handoff assets + results)
+rules ──────▶ .claude-continuity-rules.json at project root (git-friendly, provenance) → injected into smart_read/resume, optional CLAUDE.md sync
 ```
 
 Everything local: the ledger and the inbox are SQLite files on disk; checkpoints are readable/editable JSON. No network, no API keys, no external dependencies for the core.
@@ -217,7 +231,7 @@ If `router_config.json` doesn't exist, the defaults apply (zero-config). **Logic
 ## Known limitations
 
 - BM25 is lexical: a query with no words in common with the text degrades to the first chunks of the file. Installing `fastembed` improves semantic queries (requires onnxruntime compatible with your Python version).
-- There's no semantic memory of "project decisions" yet (e.g., "never use Redux"): the checkpoint captures task state, not permanent rules. It's a natural pending extension.
+- BM25 project-wide search across files isn't there yet: `smart_read` is per-file, so "where is X handled *in the project*?" still falls back to native Grep. A persistent incremental index is the natural next step.
 - `code_staleness` detects that the code changed — it doesn't restart itself. Auto-restart isn't safe here: multiple clients may share the same process, and killing it mid-inbox-order would cut the tool out from under another session with no guarantee it comes back on its own.
 
 ## License

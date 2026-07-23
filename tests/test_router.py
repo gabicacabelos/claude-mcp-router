@@ -925,3 +925,139 @@ def test_prompts_exist_and_reference_the_tools(server_module):
 def test_prompt_handoff_without_args_asks_the_user(server_module):
     h = server_module.prompt_handoff()
     assert "preguntale al usuario" in h
+
+
+# ─── rules: reglas de proyecto con procedencia (módulo) ───────────────────────
+
+from router import rules as R
+
+
+def test_rules_add_and_load_with_provenance(tmp_path):
+    rule, created = R.add_rule(tmp_path, "nunca usar Redux", source_client="code", checkpoint="cp-arch")
+    assert created is True
+    assert rule["text"] == "nunca usar Redux"
+    assert rule["source_client"] == "code"
+    assert rule["checkpoint"] == "cp-arch"
+    assert rule["id"] == 1
+
+    loaded = R.load_rules(tmp_path)
+    assert len(loaded) == 1 and loaded[0]["text"] == "nunca usar Redux"
+    # se persiste como JSON legible en la raíz del proyecto
+    assert R.rules_path(tmp_path).is_file()
+
+
+def test_rules_add_dedup_is_case_and_space_insensitive(tmp_path):
+    R.add_rule(tmp_path, "Los tests van en tests/")
+    rule2, created2 = R.add_rule(tmp_path, "los   tests  van en tests/")
+    assert created2 is False, "una regla equivalente no debe duplicarse"
+    assert len(R.load_rules(tmp_path)) == 1
+    assert rule2["id"] == 1
+
+
+def test_rules_remove(tmp_path):
+    R.add_rule(tmp_path, "regla A")
+    r2, _ = R.add_rule(tmp_path, "regla B")
+    assert R.remove_rule(tmp_path, r2["id"]) is True
+    assert [r["text"] for r in R.load_rules(tmp_path)] == ["regla A"]
+    assert R.remove_rule(tmp_path, 999) is False
+
+
+def test_rules_load_missing_and_corrupt_are_safe(tmp_path):
+    assert R.load_rules(tmp_path) == []  # sin archivo
+    R.rules_path(tmp_path).write_text("{roto", encoding="utf-8")
+    assert R.load_rules(tmp_path) == []  # corrupto → [], no lanza
+
+
+def test_rules_walk_up_discovery(tmp_path):
+    # reglas en la raíz del proyecto; un archivo anidado debe encontrarlas
+    R.add_rule(tmp_path, "regla raíz")
+    nested = tmp_path / "src" / "deep"
+    nested.mkdir(parents=True)
+    f = nested / "modulo.py"
+    f.write_text("x = 1", encoding="utf-8")
+    found = R.rules_for_file(str(f))
+    assert len(found) == 1 and found[0]["text"] == "regla raíz"
+
+
+def test_rules_sync_to_claudemd_delimited_and_idempotent(tmp_path):
+    R.add_rule(tmp_path, "nunca usar Redux", source_client="code")
+    md = R.sync_to_claudemd(tmp_path)
+    content = md.read_text(encoding="utf-8")
+    assert R.CLAUDEMD_START in content and R.CLAUDEMD_END in content
+    assert "nunca usar Redux" in content
+
+    # segundo sync no duplica la sección ni pisa contenido del usuario
+    content = "# Mi proyecto\n\nNotas mías.\n\n" + content
+    md.write_text(content, encoding="utf-8")
+    R.add_rule(tmp_path, "otra regla")
+    R.sync_to_claudemd(tmp_path)
+    final = md.read_text(encoding="utf-8")
+    assert final.count(R.CLAUDEMD_START) == 1, "no debe duplicar la sección"
+    assert "Notas mías." in final, "no debe pisar el contenido del usuario"
+    assert "otra regla" in final
+
+
+# ─── rules: tool router_rules + inyección en payloads ─────────────────────────
+
+def _rules_tool(server_module, **kw) -> dict:
+    params = server_module.RulesInput(**kw)
+    return json.loads(asyncio.run(server_module.router_rules(params)))
+
+
+def test_router_rules_add_list_remove(server_module, tmp_path):
+    r = _rules_tool(server_module, action="add", project_dir=str(tmp_path),
+                    text="nunca usar Redux", from_client="code")
+    assert r["status"] == "added"
+    assert _rules_tool(server_module, action="add", project_dir=str(tmp_path),
+                       text="nunca usar Redux")["status"] == "duplicate"
+
+    listed = _rules_tool(server_module, action="list", project_dir=str(tmp_path))
+    assert len(listed["rules"]) == 1
+
+    rid = r["rule"]["id"]
+    assert _rules_tool(server_module, action="remove", project_dir=str(tmp_path),
+                       rule_id=rid)["status"] == "removed"
+    assert _rules_tool(server_module, action="list", project_dir=str(tmp_path))["rules"] == []
+
+
+def test_router_rules_promote_from_checkpoint(server_module, tmp_path, monkeypatch):
+    monkeypatch.setattr(server_module, "_checkpoints_dir", tmp_path / "cps")
+    _checkpoint(server_module, action="save", name="arch",
+                summary="decisiones de arquitectura", decisions=["nunca usar Redux"])
+    r = _rules_tool(server_module, action="promote", project_dir=str(tmp_path),
+                    checkpoint="arch", from_client="code")
+    assert r["status"] == "promoted"
+    assert r["rule"]["text"] == "nunca usar Redux"
+    assert r["rule"]["checkpoint"] == "arch", "la procedencia debe apuntar al checkpoint de origen"
+
+
+def test_router_rules_sync_to_claudemd_flag(server_module, tmp_path):
+    r = _rules_tool(server_module, action="add", project_dir=str(tmp_path),
+                    text="regla sincronizada", sync_to_claudemd=True)
+    assert "claudemd" in r
+    md_content = (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "regla sincronizada" in md_content
+
+
+def test_smart_read_injects_project_rules(server_module, tmp_path, monkeypatch):
+    led = FileLedger(str(tmp_path / "rl.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    R.add_rule(tmp_path, "nunca usar Redux", source_client="code")
+    f = tmp_path / "chico.py"
+    f.write_text("print('hola')", encoding="utf-8")
+
+    r = _smart_read(server_module, file_path=str(f))
+    assert "project_rules" in r
+    assert "nunca usar Redux" in r["project_rules"]
+    led.close()
+
+
+def test_smart_read_omits_project_rules_when_none(server_module, tmp_path, monkeypatch):
+    led = FileLedger(str(tmp_path / "rl2.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    f = tmp_path / "chico2.py"
+    f.write_text("print('hola')", encoding="utf-8")
+
+    r = _smart_read(server_module, file_path=str(f))
+    assert "project_rules" not in r, "sin reglas, el campo no debe existir (disciplina de tokens)"
+    led.close()

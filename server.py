@@ -48,6 +48,7 @@ from router.inbox import Inbox
 from router.ledger import FileLedger
 from router.ranker import build_outline, chunk_text, rank_chunks
 from router.sanitizer import sanitize_file_content
+from router import rules as project_rules
 
 # ─────────────────────────────────────────────
 # Bootstrap
@@ -103,7 +104,7 @@ _stats = {
     "diff_reads": 0,
 }
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 # Umbral: archivos por debajo se devuelven enteros (el overhead de RAG no rinde)
 FULL_RETURN_MAX_TOKENS = 1500
@@ -201,6 +202,7 @@ INSTRUCTIONS = """Memoria y continuidad para Claude entre sesiones y clientes �
 2. router_checkpoint: al cerrar una tarea larga o cuando el contexto se está llenando, guardá un checkpoint (action=save) con resumen, decisiones y pendientes. Al arrancar una sesión sobre trabajo previo, action=resume lo restaura en ~300 tokens e indica qué archivos cambiaron desde entonces.
 3. router_inbox: buzón de órdenes entre clientes (Cowork/Code/Desktop/Design). Si el usuario dice "dejale esta tarea a Claude Code", "pasale el diseño a Claude Design", "que Design haga el mockup" o similar: action=send con la orden, un checkpoint vinculado y `assets` (rutas/URLs de brief, wireframe, export .fig/.png) para el handoff código↔diseño. AL INICIO de sesiones de trabajo, chequeá órdenes pendientes con action=check; al ejecutarlas marcá complete con el resultado (y `assets` devueltos si generaste algo, ej. el export de un mockup).
 4. router_status: métricas de la sesión (tokens que no entraron al contexto, lecturas, checkpoints, inbox).
+5. router_rules: reglas PERMANENTES del proyecto ("nunca usar Redux", "los tests van en tests/"), distintas del estado de tarea de un checkpoint. Guardá una con action=add cuando el usuario fije una convención durable, o promové una decisión de un checkpoint con action=promote. Viven en .claude-continuity-rules.json en la raíz del proyecto (git-friendly). NO hace falta leerlas: se inyectan solas como `project_rules` en smart_read/resume. sync_to_claudemd=true además las escribe en el CLAUDE.md.
 Todas las salidas vienen en JSON minificado."""
 
 mcp = FastMCP("claude_continuity_mcp", instructions=INSTRUCTIONS)
@@ -271,6 +273,28 @@ class InboxInput(BaseModel):
     result: Optional[str] = Field(default=None, description="[complete] Resultado/resumen de lo ejecutado, visible para quien dejó la orden")
 
 
+class RulesInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    action: Literal["add", "list", "remove", "promote"] = Field(
+        ...,
+        description="add=nueva regla permanente | list=reglas del proyecto | remove=eliminar por id | promote=promover una decisión de un checkpoint a regla",
+    )
+    project_dir: str = Field(
+        ..., min_length=1,
+        description="Raíz del proyecto: ahí vive .claude-continuity-rules.json (git-friendly) y el CLAUDE.md si se sincroniza",
+    )
+    text: Optional[str] = Field(default=None, description="[add] El texto literal de la regla (ej: 'nunca usar Redux')")
+    from_client: Optional[str] = Field(default=None, description="[add/promote] Quién la decide: 'code', 'cowork', 'desktop', 'design' o el nombre del humano")
+    checkpoint: Optional[str] = Field(default=None, description="[add] Checkpoint de procedencia | [promote] checkpoint del que se promueve la decisión")
+    decision_index: Optional[int] = Field(default=None, ge=0, description="[promote] Índice (0-based) de la decisión a promover; si el checkpoint tiene una sola, se asume")
+    rule_id: Optional[int] = Field(default=None, description="[remove] id de la regla a eliminar")
+    sync_to_claudemd: bool = Field(
+        default=False,
+        description="True = además escribir/actualizar la sección delimitada de reglas en el CLAUDE.md del proyecto (alimenta la memoria nativa de Claude Code)",
+    )
+
+
 class StatusInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -322,6 +346,11 @@ async def router_smart_read(params: SmartReadInput) -> str:
     if was_html:
         base["html_stripped"] = True
         base["tokens_after_clean"] = tok_clean
+    # Reglas del proyecto inyectadas (piggyback): Claude las ve al tocar un
+    # archivo del proyecto sin una llamada aparte. Se omite si no hay reglas.
+    _rules = _rules_for_paths([str(fp)])
+    if _rules:
+        base["project_rules"] = _rules
 
     # ─── Memoria cross-sesión (ledger) — solo cuando no hay query ni force_full ───
     key = str(fp.resolve())
@@ -477,7 +506,7 @@ def _cold_start_digest() -> dict:
         logger.warning(f"digest: inbox.history falló: {e}")
         orders = []
     changed = [f["path"] for f in recent if f["state"] == "changed"]
-    return {
+    digest = {
         "status": "resumed",
         "mode": "reconstructed_activity",
         "note": "no hay checkpoints guardados — esto es actividad RECONSTRUIDA del ledger/inbox "
@@ -491,6 +520,10 @@ def _cold_start_digest() -> dict:
             "podés retomar desde los archivos recientes; guardá checkpoints al cerrar tareas para resumes con contexto real"
         ),
     }
+    _rules = _rules_for_paths([f["path"] for f in recent])
+    if _rules:
+        digest["project_rules"] = _rules
+    return digest
 
 
 @mcp.tool(
@@ -572,7 +605,7 @@ async def router_checkpoint(params: CheckpointInput) -> str:
 
     file_states = ledger.check_files(data.get("files", []))
     changed = [f["path"] for f in file_states if f["state"] == "changed"]
-    return _j({
+    out = {
         "status": "resumed",
         "name": data.get("name"),
         "saved_at": data.get("saved_at"),
@@ -584,7 +617,11 @@ async def router_checkpoint(params: CheckpointInput) -> str:
             f"archivos modificados desde el checkpoint: {changed} — leelos con router_smart_read para ver solo los diffs"
             if changed else "ningún archivo relevante cambió desde el checkpoint"
         ),
-    })
+    }
+    _rules = _rules_for_paths([f["path"] for f in file_states])
+    if _rules:
+        out["project_rules"] = _rules
+    return _j(out)
 
 
 # ─────────────────────────────────────────────
@@ -736,6 +773,116 @@ async def router_status(params: StatusInput) -> str:
         status["diagnostics"] = diag
 
     return _j(status)
+
+
+# ─────────────────────────────────────────────
+# Tool 5: rules — reglas permanentes del proyecto, con procedencia
+# ─────────────────────────────────────────────
+
+def _rules_for_paths(paths: list[str]) -> list[str]:
+    """Reglas de los proyectos a los que pertenecen estos paths (dedup por archivo de reglas)."""
+    seen: set = set()
+    collected: list[dict] = []
+    for p in paths:
+        try:
+            rf = project_rules.find_rules_file(p)
+        except Exception:
+            continue
+        if rf and rf not in seen:
+            seen.add(rf)
+            collected.extend(project_rules.load_rules(rf.parent))
+    return project_rules.inject_texts(collected)
+
+
+@mcp.tool(
+    name="router_rules",
+    annotations={
+        "title": "Reglas Permanentes del Proyecto (con procedencia)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def router_rules(params: RulesInput) -> str:
+    """
+    Reglas PERMANENTES del proyecto ("nunca usar Redux"), distintas del estado
+    de tarea de un checkpoint. Cada una con procedencia: quién, cuándo, y de qué
+    checkpoint nació. Viven en .claude-continuity-rules.json en la raíz del
+    proyecto — git-friendly, editable a mano, viaja con el repo.
+
+    No hace falta llamar para LEERLAS: se inyectan solas como `project_rules`
+    en smart_read y resume de archivos del proyecto.
+
+    add: nueva regla (texto literal, sin síntesis). Dedup automático.
+    promote: convierte una decisión de un checkpoint en regla permanente.
+    sync_to_claudemd=true: además mantiene una sección delimitada en el
+    CLAUDE.md del proyecto (alimenta la memoria nativa de Claude Code).
+    """
+    pdir = Path(params.project_dir)
+    if not pdir.is_dir():
+        return _j({"status": "error", "reason": f"project_dir no existe: {params.project_dir}"})
+
+    if params.action == "add":
+        if not params.text:
+            return _j({"status": "error", "reason": "add requiere `text`"})
+        rule, created = project_rules.add_rule(
+            pdir, params.text, params.from_client or "unknown", params.checkpoint)
+        out = {"status": "added" if created else "duplicate", "rule": rule,
+               "rules_file": str(project_rules.rules_path(pdir))}
+        if not created:
+            out["hint"] = "ya existía una regla equivalente — se devuelve la existente"
+        if params.sync_to_claudemd:
+            out["claudemd"] = str(project_rules.sync_to_claudemd(pdir))
+        return _j(out)
+
+    if params.action == "list":
+        return _j({
+            "status": "ok",
+            "rules": project_rules.load_rules(pdir),
+            "rules_file": str(project_rules.rules_path(pdir)),
+            "hint": "estas reglas se inyectan solas en smart_read/resume de archivos de este proyecto",
+        })
+
+    if params.action == "remove":
+        if params.rule_id is None:
+            return _j({"status": "error", "reason": "remove requiere `rule_id`"})
+        if not project_rules.remove_rule(pdir, params.rule_id):
+            return _j({"status": "error", "reason": f"no existe regla id={params.rule_id}"})
+        out = {"status": "removed", "rule_id": params.rule_id}
+        if params.sync_to_claudemd:
+            out["claudemd"] = str(project_rules.sync_to_claudemd(pdir))
+        return _j(out)
+
+    # promote — decisión de checkpoint → regla permanente (procedencia incluida)
+    if not params.checkpoint:
+        return _j({"status": "error", "reason": "promote requiere `checkpoint`"})
+    cp_path = _checkpoints_dir / f"{_safe_name(params.checkpoint)}.json"
+    if not cp_path.exists():
+        return _j({"status": "error", "reason": f"checkpoint '{params.checkpoint}' no existe — usar router_checkpoint action=list"})
+    try:
+        cp = json.loads(cp_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return _j({"status": "error", "reason": f"checkpoint corrupto: {e}"})
+    decisions = cp.get("decisions") or []
+    if not decisions:
+        return _j({"status": "error", "reason": "el checkpoint no tiene `decisions` para promover"})
+    idx = params.decision_index
+    if idx is None:
+        if len(decisions) != 1:
+            return _j({"status": "error", "reason": "hay varias decisiones — pasá `decision_index`",
+                       "decisions": decisions})
+        idx = 0
+    if idx >= len(decisions):
+        return _j({"status": "error", "reason": f"decision_index {idx} fuera de rango ({len(decisions)} decisiones)",
+                   "decisions": decisions})
+    rule, created = project_rules.add_rule(
+        pdir, decisions[idx], params.from_client or "unknown", params.checkpoint)
+    out = {"status": "promoted" if created else "duplicate", "rule": rule,
+           "rules_file": str(project_rules.rules_path(pdir))}
+    if params.sync_to_claudemd:
+        out["claudemd"] = str(project_rules.sync_to_claudemd(pdir))
+    return _j(out)
 
 
 # ─────────────────────────────────────────────
