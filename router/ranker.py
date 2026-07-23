@@ -149,13 +149,30 @@ def _cosine(a, b) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
-def _embed_scores(query: str, chunks: list[Chunk]) -> list[float] | None:
+def _embed_scores(query: str, chunks: list[Chunk],
+                  file_hash: str | None = None, vector_store=None) -> list[float] | None:
     emb = _get_embedder()
     if emb is None:
         return None
     try:
         q_vec = list(emb.embed([query]))[0]
-        c_vecs = list(emb.embed([c.text[:2000] for c in chunks]))
+        # Reusar vectores de chunk cacheados si el hash del archivo coincide —
+        # los vectores son lo caro (CPU); solo re-embebemos la query.
+        c_vecs = None
+        if vector_store is not None and file_hash:
+            try:
+                cached = vector_store.get_chunk_vectors(file_hash)
+            except Exception:
+                cached = None
+            if cached is not None and len(cached) == len(chunks):
+                c_vecs = cached
+        if c_vecs is None:
+            c_vecs = list(emb.embed([c.text[:2000] for c in chunks]))
+            if vector_store is not None and file_hash:
+                try:
+                    vector_store.put_chunk_vectors(file_hash, c_vecs)
+                except Exception as e:
+                    logger.warning(f"cache de vectores falló: {e}")
         return [_cosine(q_vec, v) for v in c_vecs]
     except Exception as e:
         logger.warning(f"fastembed falló en runtime: {e} — usando BM25")
@@ -173,10 +190,14 @@ def _normalize(scores: list[float]) -> list[float]:
 
 # ─── API pública ─────────────────────────────────────────────────────────────
 
-def rank_chunks(text: str, query: str, top_k: int = 4) -> tuple[list[Chunk], str]:
+def rank_chunks(text: str, query: str, top_k: int = 4,
+                file_hash: str | None = None, vector_store=None) -> tuple[list[Chunk], str]:
     """
     Devuelve (top_k chunks ordenados por posición en el archivo, motor_usado).
     Determinista con BM25; híbrido si fastembed está disponible.
+
+    file_hash/vector_store (opcionales): si se pasan, los vectores de embedding
+    de los chunks se cachean/reusan por hash de contenido (no cambia el ranking).
     """
     chunks = chunk_text(text)
     if not chunks:
@@ -186,7 +207,7 @@ def rank_chunks(text: str, query: str, top_k: int = 4) -> tuple[list[Chunk], str
 
     q_tokens = tokenize(query)
     bm25 = _normalize(_bm25(q_tokens, chunks))
-    emb = _embed_scores(query, chunks)
+    emb = _embed_scores(query, chunks, file_hash=file_hash, vector_store=vector_store)
     engine = "bm25"
     if emb is not None:
         emb_n = _normalize(emb)

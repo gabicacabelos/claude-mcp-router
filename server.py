@@ -303,10 +303,48 @@ async def router_smart_read(params: SmartReadInput) -> str:
         _ledger_safe_record(key, content, tok_clean)
         return _j({"status": "full", **base, "content": content})
 
-    # Grande + query → chunks exactos rankeados localmente
+    # Grande + query → chunks exactos rankeados localmente (con cache por hash+query)
     if params.query:
         _ledger_safe_record(key, content, tok_clean)
-        top, engine = rank_chunks(content, params.query, top_k=params.top_k)
+        new_hash = FileLedger.hash(content)
+        q_norm = FileLedger.normalize_query(params.query)
+
+        # Cache HIT: query repetida sobre archivo sin cambios → releer esas líneas,
+        # sin re-chunkear ni re-rankear. Invalidación automática por hash.
+        if not params.force_full:
+            cached = None
+            try:
+                cached = ledger.get_query_cache(new_hash, q_norm, params.top_k)
+            except Exception as e:
+                logger.warning(f"query cache get falló: {e}")
+            if cached:
+                lines = content.split("\n")
+                chunks_out = [
+                    {"lines": f"{s}-{e}", "text": "\n".join(lines[s - 1:e])}
+                    for s, e in cached
+                ]
+                delivered = sum(_tokens(c["text"]) for c in chunks_out)
+                _stats["tokens_delivered"] += delivered
+                return _j({
+                    "status": "chunks",
+                    **base,
+                    "query": params.query,
+                    "engine": "cache",
+                    "cache_hit": True,
+                    "tokens_delivered": delivered,
+                    "saved_vs_full_pct": round((1 - delivered / max(1, tok_clean)) * 100, 1),
+                    "chunks": chunks_out,
+                    "note": "fragmentos EXACTOS del archivo (cache) — para más contexto repetir con otra query o top_k mayor",
+                })
+
+        top, engine = rank_chunks(content, params.query, top_k=params.top_k,
+                                  file_hash=new_hash, vector_store=ledger)
+        if not params.force_full:
+            try:
+                ledger.put_query_cache(new_hash, q_norm, params.top_k,
+                                       [(c.start_line, c.end_line) for c in top])
+            except Exception as e:
+                logger.warning(f"query cache put falló: {e}")
         delivered = sum(_tokens(c.text) for c in top)
         _stats["tokens_delivered"] += delivered
         return _j({
@@ -314,6 +352,7 @@ async def router_smart_read(params: SmartReadInput) -> str:
             **base,
             "query": params.query,
             "engine": engine,
+            "cache_hit": False,
             "tokens_delivered": delivered,
             "saved_vs_full_pct": round((1 - delivered / max(1, tok_clean)) * 100, 1),
             "chunks": [

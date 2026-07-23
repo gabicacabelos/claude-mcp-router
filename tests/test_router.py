@@ -10,9 +10,14 @@ Cubre:
 Todas las DBs usan tmp_path de pytest. Cero red, cero side-effects fuera del tmp.
 """
 
+import asyncio
+import importlib.util
+import json
 import time
 
 import pytest
+
+_HAS_FASTEMBED = importlib.util.find_spec("fastembed") is not None
 
 from router.ranker import build_outline, chunk_text, rank_chunks
 from router.sanitizer import clean_text, strip_html
@@ -524,3 +529,147 @@ def test_code_staleness_false_when_boot_is_in_the_future(server_module):
     # boot_time posterior a cualquier mtime real → nada "cambió después"
     result = server_module._code_staleness(time.time() + 3600)
     assert result == {"stale": False}
+
+
+# ─── ledger: cache de ranking por query (#1) ──────────────────────────────────
+
+def test_normalize_query_collapses_spaces_and_casefolds():
+    assert FileLedger.normalize_query("  Buscar   Los  Webhooks ") == "buscar los webhooks"
+    assert FileLedger.normalize_query("MISMA") == FileLedger.normalize_query("misma")
+
+
+def test_ledger_query_cache_roundtrip_and_key_distinction(ledger):
+    ledger.put_query_cache("h1", "webhooks", 4, [(1, 10), (20, 25)])
+    assert ledger.get_query_cache("h1", "webhooks", 4) == [(1, 10), (20, 25)]
+    # distinto top_k, query o hash → miss (son parte de la clave)
+    assert ledger.get_query_cache("h1", "webhooks", 2) is None
+    assert ledger.get_query_cache("h1", "otra", 4) is None
+    assert ledger.get_query_cache("h2", "webhooks", 4) is None
+
+
+def test_ledger_query_cache_invalidates_by_content_hash(ledger):
+    # el hash del contenido ES la clave → contenido nuevo = hash nuevo = miss
+    h_old = FileLedger.hash("contenido viejo")
+    h_new = FileLedger.hash("contenido nuevo distinto")
+    ledger.put_query_cache(h_old, "q", 4, [(1, 5)])
+    assert ledger.get_query_cache(h_old, "q", 4) == [(1, 5)]
+    assert ledger.get_query_cache(h_new, "q", 4) is None
+
+
+# ─── ledger: cache de vectores de embeddings (#2) ─────────────────────────────
+
+def test_ledger_chunk_vectors_roundtrip(ledger):
+    vecs = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+    ledger.put_chunk_vectors("hashA", vecs)
+    got = ledger.get_chunk_vectors("hashA")
+    assert got is not None and len(got) == 2
+    for orig, back in zip(vecs, got):
+        assert all(abs(a - b) < 1e-6 for a, b in zip(orig, back)), "round-trip float32 debe conservar valores"
+
+
+def test_ledger_chunk_vectors_missing_returns_none(ledger):
+    assert ledger.get_chunk_vectors("no_existe") is None
+
+
+def test_ledger_chunk_vectors_replaces_on_reput(ledger):
+    ledger.put_chunk_vectors("h", [[1.0], [2.0], [3.0]])
+    ledger.put_chunk_vectors("h", [[9.0]])  # reemplaza, no acumula
+    got = ledger.get_chunk_vectors("h")
+    assert len(got) == 1
+    assert abs(got[0][0] - 9.0) < 1e-6
+
+
+def test_ledger_purge_removes_orphan_caches(ledger):
+    # file_hash sin entrada en file_ledger → cachés huérfanos, se limpian en purge
+    ledger.put_query_cache("orphan", "q", 4, [(1, 5)])
+    ledger.put_chunk_vectors("orphan", [[1.0, 2.0]])
+    ledger.purge()
+    assert ledger.get_query_cache("orphan", "q", 4) is None
+    assert ledger.get_chunk_vectors("orphan") is None
+
+
+def test_ledger_purge_keeps_caches_for_tracked_file(ledger):
+    content = "algo de contenido trackeado"
+    h = FileLedger.hash(content)
+    ledger.record("/tracked.py", content, [], tokens=1)  # mete el hash en file_ledger
+    ledger.put_query_cache(h, "q", 4, [(1, 3)])
+    ledger.put_chunk_vectors(h, [[0.5, 0.5]])
+    ledger.purge()
+    assert ledger.get_query_cache(h, "q", 4) == [(1, 3)]
+    assert ledger.get_chunk_vectors(h) is not None
+
+
+# ─── ranker: reuso de vectores no cambia el ranking ───────────────────────────
+
+def test_rank_chunks_vector_store_param_does_not_change_bm25(ledger):
+    """Pasar file_hash/vector_store no altera el ranking (backward-compatible)."""
+    text = _make_sectioned_text(8, 40, keyword_section=3, keyword="quokka")
+    top_a, eng_a = rank_chunks(text, "quokka", top_k=2)
+    top_b, eng_b = rank_chunks(text, "quokka", top_k=2, file_hash="h", vector_store=ledger)
+    assert eng_a == eng_b
+    assert [(c.start_line, c.end_line) for c in top_a] == [(c.start_line, c.end_line) for c in top_b]
+
+
+@pytest.mark.skipif(not _HAS_FASTEMBED, reason="fastembed no instalado — #2 no aplica")
+def test_rank_chunks_cached_vectors_same_ranking(ledger):
+    text = _make_sectioned_text(8, 40, keyword_section=3, keyword="quokka")
+    # 1ª pasada puebla el cache de vectores; 2ª lo reusa → mismo ranking y scores
+    top1, _ = rank_chunks(text, "quokka marsupial", top_k=3, file_hash="hv", vector_store=ledger)
+    top2, _ = rank_chunks(text, "quokka marsupial", top_k=3, file_hash="hv", vector_store=ledger)
+    assert [(c.start_line, c.end_line, c.score) for c in top1] == \
+           [(c.start_line, c.end_line, c.score) for c in top2]
+
+
+# ─── server: cache de query end-to-end en router_smart_read ───────────────────
+
+def _smart_read(server_module, **kw) -> dict:
+    params = server_module.SmartReadInput(**kw)
+    return json.loads(asyncio.run(server_module.router_smart_read(params)))
+
+
+def test_smart_read_query_cache_hit_returns_same_ranges(server_module, tmp_path, monkeypatch):
+    led = FileLedger(str(tmp_path / "led.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    f = tmp_path / "big.py"
+    f.write_text(_make_sectioned_text(8, 40, keyword_section=3, keyword="quokka"), encoding="utf-8")
+
+    r1 = _smart_read(server_module, file_path=str(f), query="quokka", top_k=2)
+    assert r1["status"] == "chunks"
+    assert r1["cache_hit"] is False
+    ranges1 = [c["lines"] for c in r1["chunks"]]
+
+    r2 = _smart_read(server_module, file_path=str(f), query="quokka", top_k=2)
+    assert r2["cache_hit"] is True
+    assert r2["engine"] == "cache"
+    assert [c["lines"] for c in r2["chunks"]] == ranges1, "el cache debe devolver los mismos ranges"
+    led.close()
+
+
+def test_smart_read_query_cache_invalidated_on_file_change(server_module, tmp_path, monkeypatch):
+    led = FileLedger(str(tmp_path / "led2.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    f = tmp_path / "big2.py"
+    f.write_text(_make_sectioned_text(8, 40, keyword_section=3, keyword="quokka"), encoding="utf-8")
+
+    assert _smart_read(server_module, file_path=str(f), query="quokka", top_k=2)["cache_hit"] is False
+    assert _smart_read(server_module, file_path=str(f), query="quokka", top_k=2)["cache_hit"] is True
+
+    # el archivo cambia → nuevo hash → el cache queda inalcanzable
+    f.write_text(_make_sectioned_text(9, 45, keyword_section=6, keyword="quokka"), encoding="utf-8")
+    r3 = _smart_read(server_module, file_path=str(f), query="quokka", top_k=2)
+    assert r3["cache_hit"] is False, "un archivo modificado debe invalidar el cache de query"
+    led.close()
+
+
+def test_smart_read_force_full_bypasses_query_cache(server_module, tmp_path, monkeypatch):
+    led = FileLedger(str(tmp_path / "led3.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    f = tmp_path / "big3.py"
+    f.write_text(_make_sectioned_text(8, 40, keyword_section=3, keyword="quokka"), encoding="utf-8")
+
+    # popula el cache con una lectura normal
+    assert _smart_read(server_module, file_path=str(f), query="quokka", top_k=2)["cache_hit"] is False
+    # con force_full el cache no se usa aunque exista
+    r = _smart_read(server_module, file_path=str(f), query="quokka", top_k=2, force_full=True)
+    assert r["cache_hit"] is False
+    led.close()

@@ -16,6 +16,7 @@ import json
 import logging
 import sqlite3
 import time
+from array import array
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,29 @@ class FileLedger:
                 first_seen REAL,
                 last_seen REAL,
                 reads INTEGER DEFAULT 1
+            )
+        """)
+        # Cache de ranking por query: (contenido, query, top_k) → line ranges.
+        # Keyed por el hash del contenido sanitizado → si el archivo cambia,
+        # cambia el hash y la entrada vieja queda inalcanzable (invalidación automática).
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS query_cache (
+                file_hash TEXT NOT NULL,
+                query_norm TEXT NOT NULL,
+                top_k INTEGER NOT NULL,
+                ranges TEXT NOT NULL,
+                created REAL,
+                PRIMARY KEY (file_hash, query_norm, top_k)
+            )
+        """)
+        # Cache de vectores de chunk (fastembed) por file_hash — evita re-embeber
+        # todos los chunks en cada query. Un vector por fila (float32 empaquetado).
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS chunk_vectors (
+                file_hash TEXT NOT NULL,
+                chunk_idx INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                PRIMARY KEY (file_hash, chunk_idx)
             )
         """)
         self._db.commit()
@@ -78,6 +102,12 @@ class FileLedger:
             self._db.commit()
             self._db.execute("VACUUM")
 
+        # Cachés derivados: si el file_hash ya no vive en el ledger, sus entradas
+        # de query/vectores son inalcanzables → se limpian para no inflar el disco.
+        self._db.execute("DELETE FROM query_cache WHERE file_hash NOT IN (SELECT hash FROM file_ledger)")
+        self._db.execute("DELETE FROM chunk_vectors WHERE file_hash NOT IN (SELECT hash FROM file_ledger)")
+        self._db.commit()
+
         if expired or snapshots_dropped:
             logger.info(f"Ledger: {expired} entradas expiradas, {snapshots_dropped} snapshots liberados")
         return {"expired": expired, "snapshots_dropped": snapshots_dropped}
@@ -85,6 +115,11 @@ class FileLedger:
     @staticmethod
     def hash(content: str) -> str:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def normalize_query(query: str) -> str:
+        """Normaliza una query para cache: colapsa espacios y case-fold."""
+        return " ".join(query.split()).casefold()
 
     def get(self, path: str) -> dict | None:
         row = self._db.execute(
@@ -138,6 +173,48 @@ class FileLedger:
         if len(d) > len(new) * DIFF_MAX_RATIO:
             return None
         return d
+
+    # ─── Cache de ranking por query (#1) ──────────────────────────────────────
+
+    def get_query_cache(self, file_hash: str, query_norm: str, top_k: int) -> list[tuple[int, int]] | None:
+        """Line ranges cacheados para (file_hash, query, top_k). None si no hay hit."""
+        row = self._db.execute(
+            "SELECT ranges FROM query_cache WHERE file_hash=? AND query_norm=? AND top_k=?",
+            (file_hash, query_norm, top_k),
+        ).fetchone()
+        if not row:
+            return None
+        return [(int(a), int(b)) for a, b in json.loads(row[0])]
+
+    def put_query_cache(self, file_hash: str, query_norm: str, top_k: int,
+                        ranges: list[tuple[int, int]]) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO query_cache (file_hash, query_norm, top_k, ranges, created) "
+            "VALUES (?,?,?,?,?)",
+            (file_hash, query_norm, top_k, json.dumps([[int(a), int(b)] for a, b in ranges]), time.time()),
+        )
+        self._db.commit()
+
+    # ─── Cache de vectores de embeddings (#2) ─────────────────────────────────
+
+    def get_chunk_vectors(self, file_hash: str) -> list[list[float]] | None:
+        """Vectores de chunk cacheados para file_hash (en orden), o None si no hay."""
+        rows = self._db.execute(
+            "SELECT vector FROM chunk_vectors WHERE file_hash=? ORDER BY chunk_idx",
+            (file_hash,),
+        ).fetchall()
+        if not rows:
+            return None
+        return [list(array("f", r[0])) for r in rows]
+
+    def put_chunk_vectors(self, file_hash: str, vectors: list) -> None:
+        """Persiste los vectores de chunk (float32 empaquetado) reemplazando los previos."""
+        self._db.execute("DELETE FROM chunk_vectors WHERE file_hash=?", (file_hash,))
+        self._db.executemany(
+            "INSERT INTO chunk_vectors (file_hash, chunk_idx, vector) VALUES (?,?,?)",
+            [(file_hash, i, array("f", [float(x) for x in v]).tobytes()) for i, v in enumerate(vectors)],
+        )
+        self._db.commit()
 
     def check_files(self, files: list[dict]) -> list[dict]:
         """
