@@ -90,12 +90,41 @@ class Inbox:
         except (json.JSONDecodeError, TypeError):
             return []
 
+    def find_pending_duplicate(self, to_client: str, message: str) -> dict | None:
+        """
+        Busca una orden PENDIENTE con el mismo destino exacto y el mismo mensaje
+        (normalizado: espacios colapsados, sin distinguir mayúsculas). Evita que
+        una orden se acumule dos veces en el buzón mientras la anterior sigue sin
+        resolver. No hace match contra 'any' cruzado — el destino debe ser idéntico.
+        """
+        to_client = (to_client or "any").lower().strip()
+        norm = " ".join(message.split()).casefold()
+        rows = self._db.execute(
+            "SELECT id, to_client, from_client, message, checkpoint, assets, created_at FROM inbox "
+            "WHERE status='pending' AND to_client=?",
+            (to_client,),
+        ).fetchall()
+        for r in rows:
+            if " ".join(r[3].split()).casefold() == norm:
+                return {
+                    "id": r[0], "to": r[1], "from": r[2], "message": r[3], "checkpoint": r[4],
+                    "assets": self._load_assets(r[5]),
+                    "created": time.strftime("%Y-%m-%d %H:%M", time.localtime(r[6])),
+                }
+        return None
+
     def send(self, message: str, to_client: str = "any", from_client: str = "unknown",
-             checkpoint: str | None = None, assets=None) -> int:
+             checkpoint: str | None = None, assets=None, allow_duplicate: bool = False) -> int:
+        to_client = to_client.lower().strip() or "any"
+        if not allow_duplicate:
+            dup = self.find_pending_duplicate(to_client, message)
+            if dup:
+                logger.info(f"inbox.send: orden duplicada evitada — reusando id {dup['id']} (to='{to_client}')")
+                return dup["id"]
         cur = self._db.execute(
             "INSERT INTO inbox (to_client, from_client, message, checkpoint, assets, created_at) "
             "VALUES (?,?,?,?,?,?)",
-            (to_client.lower().strip() or "any", from_client.lower().strip() or "unknown",
+            (to_client, from_client.lower().strip() or "unknown",
              message, checkpoint, self._dump_assets(assets), time.time()),
         )
         self._db.commit()

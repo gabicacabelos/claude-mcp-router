@@ -439,3 +439,48 @@ def test_inbox_migration_adds_columns_to_legacy_db(tmp_path):
                any(o["id"] == oid for o in ib.check("design"))
     finally:
         ib.close()
+
+
+# ─── inbox: no acumular duplicados ────────────────────────────────────────────
+
+def test_inbox_send_exact_duplicate_reuses_existing_id(inbox):
+    oid1 = inbox.send("migrar tests a pytest", to_client="code")
+    oid2 = inbox.send("migrar tests a pytest", to_client="code")  # idéntica, aún pendiente
+    assert oid1 == oid2, "una orden idéntica pendiente no debe crear una fila nueva"
+    assert len(inbox.check("code")) == 1
+
+
+def test_inbox_send_duplicate_ignores_whitespace_and_case(inbox):
+    oid1 = inbox.send("Migrar  tests   a pytest", to_client="code")
+    oid2 = inbox.send("migrar tests a pytest", to_client="code")
+    assert oid1 == oid2
+    assert len(inbox.check("code")) == 1
+
+
+def test_inbox_send_same_message_different_client_is_not_duplicate(inbox):
+    oid1 = inbox.send("mismo mensaje", to_client="code")
+    oid2 = inbox.send("mismo mensaje", to_client="design")
+    assert oid1 != oid2
+    assert len(inbox.check("code")) == 1
+    assert len(inbox.check("design")) == 1
+
+
+def test_inbox_send_after_complete_is_not_duplicate(inbox):
+    oid1 = inbox.send("tarea repetible", to_client="code")
+    inbox.complete(oid1, result="listo")
+    oid2 = inbox.send("tarea repetible", to_client="code")  # la anterior ya no está pendiente
+    assert oid2 != oid1
+    assert len(inbox.check("code")) == 1
+
+
+def test_inbox_send_allow_duplicate_bypasses_guard(inbox):
+    oid1 = inbox.send("forzada", to_client="code")
+    oid2 = inbox.send("forzada", to_client="code", allow_duplicate=True)
+    assert oid1 != oid2
+    assert len(inbox.check("code")) == 2
+
+
+def test_inbox_find_pending_duplicate_returns_none_when_no_match(inbox):
+    inbox.send("algo", to_client="code")
+    assert inbox.find_pending_duplicate("code", "otra cosa") is None
+    assert inbox.find_pending_duplicate("design", "algo") is None  # destino distinto, no matchea

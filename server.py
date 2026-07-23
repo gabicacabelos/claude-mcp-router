@@ -434,6 +434,11 @@ async def router_inbox(params: InboxInput) -> str:
     send: dejá una orden (ej. desde Cowork para Claude Code, o entre Code y
           Design), opcionalmente vinculada a un checkpoint y con `assets`
           (rutas/URLs de brief, wireframe, export .fig/.png) para el handoff.
+          Antes de enviar, SIEMPRE chequeá con action=check/history si ya hay
+          una orden pendiente o reciente para lo mismo, para no acumular
+          duplicados — igual el server rechaza duplicados exactos (mismo
+          destino + mismo mensaje ya pendiente) devolviendo status=duplicate
+          con el id existente en vez de crear uno nuevo.
     check: al arrancar una sesión, mirá si hay órdenes pendientes para vos.
     complete: marcá la orden hecha con un resumen del resultado y, si aplica,
           `assets` devueltos (ej. Design entrega el export del mockup).
@@ -447,15 +452,23 @@ async def router_inbox(params: InboxInput) -> str:
                 cp_path = _checkpoints_dir / f"{_safe_name(params.checkpoint)}.json"
                 if not cp_path.exists():
                     return _j({"status": "error", "reason": f"checkpoint '{params.checkpoint}' no existe — guardalo primero con router_checkpoint"})
+            to = params.to or "any"
+            dup = inbox.find_pending_duplicate(to, params.message)
+            if dup:
+                return _j({
+                    "status": "duplicate", "id": dup["id"], "to": to,
+                    "note": f"ya existe una orden pendiente idéntica (id={dup['id']}, creada {dup['created']}) sin resolver — no se creó una nueva. "
+                            "Si es intencional, cambiá el mensaje o pedile al destinatario que la complete/vos cancelala primero.",
+                })
             oid = inbox.send(
                 message=params.message,
-                to_client=params.to or "any",
+                to_client=to,
                 from_client=params.from_client or "unknown",
                 checkpoint=params.checkpoint,
                 assets=params.assets,
             )
             return _j({
-                "status": "sent", "id": oid, "to": params.to or "any",
+                "status": "sent", "id": oid, "to": to,
                 "checkpoint": params.checkpoint,
                 "assets": params.assets or [],
                 "note": "el destinatario la verá con router_inbox action=check",

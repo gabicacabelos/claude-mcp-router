@@ -1,6 +1,23 @@
 # INDIVIDRA MCP — Memoria persistente y compartida para Claude
 
+**Claude recuerda una conversación. Este MCP recuerda un proyecto.**
+
 MCP server que le da a Claude algo que hoy no tiene: **memoria que persiste entre sesiones y se comparte entre todos sus clientes** (Code, Desktop, Cowork, Design). Recuerda qué archivos ya leíste y devuelve solo los diffs, retoma tareas donde las dejaste, y coordina órdenes entre clientes. 100% local, determinista, sin API keys.
+
+```mermaid
+graph TD
+    A[Claude Code] --> M
+    B[Claude Desktop] --> M
+    C[Claude Cowork] --> M
+    D[Claude Design] --> M
+
+    M[("INDIVIDRA MCP<br/>━━━━━━━━━━━━━<br/>smart_read · checkpoint<br/>inbox · ledger SQLite")] --> P[(Tu proyecto<br/>en disco)]
+
+    style M fill:#1a1a2e,stroke:#00c8e8,stroke-width:2px,color:#fff
+    style P fill:#0d0d1a,stroke:#666,stroke-width:1px,color:#ccc
+```
+
+Cuatro clientes distintos, un solo estado compartido: lo que uno lee, decide o deja pendiente, cualquiera de los otros lo hereda.
 
 ## Por qué existe
 
