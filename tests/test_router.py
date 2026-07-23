@@ -365,3 +365,77 @@ def test_inbox_history_respects_limit(inbox):
     assert len(hist) == 3
     # history ordena por done_at DESC → la última completada primero
     assert hist[0]["message"] == "orden 4"
+
+
+# ─── inbox: cliente 'design' + assets de handoff ──────────────────────────────
+
+def test_inbox_design_client_roundtrip_with_assets(inbox):
+    # Claude Code le deja una orden a Claude Design, con material de handoff
+    oid = inbox.send(
+        "hero de la landing, dark + acento cyan",
+        to_client="design", from_client="code", checkpoint="landing-v2",
+        assets=["/proj/brief.md", "https://cdn/wireframe.png"],
+    )
+    pending = inbox.check("design")
+    assert len(pending) == 1
+    order = pending[0]
+    assert order["to"] == "design"
+    assert order["from"] == "code"
+    assert order["assets"] == ["/proj/brief.md", "https://cdn/wireframe.png"]
+
+    # Design completa y devuelve sus propios assets (el export del mockup)
+    assert inbox.complete(oid, result="mockup listo, 2 variantes",
+                          assets=["https://figma/hero", "/exports/hero.png"]) is True
+
+    hist = inbox.history()
+    assert hist[0]["result"] == "mockup listo, 2 variantes"
+    assert hist[0]["result_assets"] == ["https://figma/hero", "/exports/hero.png"]
+
+
+def test_inbox_assets_default_empty_and_normalizes_string(inbox):
+    # sin assets → lista vacía en el check
+    oid = inbox.send("sin material", to_client="design")
+    assert inbox.check("design")[0]["assets"] == []
+    inbox.complete(oid)
+    assert inbox.history()[0]["result_assets"] == []
+
+    # un asset como string suelto se normaliza a lista
+    oid2 = inbox.send("un solo asset", to_client="design", assets="/x/spec.md")
+    assert inbox.check("design")[0]["assets"] == ["/x/spec.md"]
+
+
+def test_inbox_migration_adds_columns_to_legacy_db(tmp_path):
+    # DB "vieja" sin las columnas nuevas → el __init__ debe migrarla sin romper
+    import sqlite3
+    dbp = str(tmp_path / "legacy_inbox.db")
+    con = sqlite3.connect(dbp)
+    con.execute("""
+        CREATE TABLE inbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            to_client TEXT NOT NULL DEFAULT 'any',
+            from_client TEXT NOT NULL DEFAULT 'unknown',
+            message TEXT NOT NULL,
+            checkpoint TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            result TEXT,
+            created_at REAL NOT NULL,
+            done_at REAL
+        )
+    """)
+    con.execute("INSERT INTO inbox (message, created_at) VALUES ('orden vieja', ?)",
+                (1_700_000_000.0,))
+    con.commit(); con.close()
+
+    ib = Inbox(dbp)  # dispara _migrate
+    try:
+        cols = {r[1] for r in ib._db.execute("PRAGMA table_info(inbox)").fetchall()}
+        assert "assets" in cols and "result_assets" in cols
+        # la orden vieja sigue visible y con assets vacíos
+        pend = ib.check()
+        assert len(pend) == 1 and pend[0]["assets"] == []
+        # y podemos mandar una nueva con assets sobre la DB migrada
+        oid = ib.send("nueva", to_client="design", assets=["/a.png"])
+        assert ib.check("design")[0]["assets"] == ["/a.png"] or \
+               any(o["id"] == oid for o in ib.check("design"))
+    finally:
+        ib.close()

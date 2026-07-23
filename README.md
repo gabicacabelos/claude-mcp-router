@@ -68,6 +68,28 @@ inbox(action="history")  → ves el resultado
 
 Los chats de Claude no pueden comandarse entre sí en tiempo real — pero comparten este disco. El inbox es el buzón asíncrono: dejás una orden desde un cliente (vinculada a un checkpoint para que el receptor tenga todo el contexto de lo que estaban haciendo), el otro la consume al arrancar, la ejecuta y reporta el resultado. Decile a Cowork *"dejale esta tarea a Claude Code"* y listo — las `instructions` del servidor hacen que cada cliente chequee su buzón al empezar a trabajar.
 
+**Clientes del pack:** `cowork`, `code`, `desktop` y `design` (Claude Design). Cualquiera puede darle órdenes a cualquiera — el destino es texto libre, así que también podés inventar roles propios. Para que un cliente reciba órdenes solo necesita tener este MCP cargado y chequear su buzón con `action="check"`.
+
+**Handoff código ↔ diseño (`assets`):** las órdenes y los resultados pueden llevar `assets` — una lista de rutas de archivos o URLs (brief, wireframe, export `.fig`/`.png`, specs). Así el ida y vuelta entre desarrollo y diseño viaja con el material, no solo el texto:
+
+```
+# Claude Code le pide un mockup a Claude Design, con el material:
+inbox(action="send", to="design", from_client="code",
+      message="hero de la landing, dark + acento cyan",
+      checkpoint="landing-v2",
+      assets=["/proj/brief.md", "https://.../wireframe.png"])
+
+# Claude Design, al arrancar, ve la orden + el brief + el wireframe:
+inbox(action="check", to="design")
+inbox(action="complete", order_id=7, result="mockup listo, 2 variantes",
+      assets=["https://figma.com/.../hero", "/exports/hero-v1.png"])
+
+# Claude Code ve el resultado y el export devuelto:
+inbox(action="history")  → result + result_assets
+```
+
+Y al revés: Claude Design puede dejarle a `code` una orden con el export final para que lo implemente. El inbox es bidireccional entre todos los clientes.
+
 ### `router_bulk_process` — Offload masivo con failover transparente
 
 ```
@@ -165,7 +187,7 @@ smart_read ──▶ sanitizer (HTML/texto, local) ──▶ ledger (¿ya lo vi?
                           ├─ fastembed (bge-small, ONNX local) si está
                           └─ BM25 puro-Python (fallback, 0 deps)
 checkpoint ──▶ checkpoints/*.json (legible/editable) + verificación de hashes al resumir
-inbox ──────▶ cola SQLite compartida (órdenes entre Cowork/Code/Desktop + resultados)
+inbox ──────▶ cola SQLite compartida (órdenes entre Cowork/Code/Desktop/Design + assets de handoff + resultados)
 bulk_process ─▶ caché SHA-256 (SQLite) ──▶ CheapLLM
                                             ├─ Groq llama-3.1-8b (LPU, rápido)
                                             ├─ OpenRouter :free (rotación de modelos)

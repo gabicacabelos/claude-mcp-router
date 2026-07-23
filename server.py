@@ -131,7 +131,7 @@ INSTRUCTIONS = """Suite de ingesta de contexto y procesamiento masivo con memori
 1. router_smart_read: para leer un archivo grande (>15KB) o buscar algo puntual en cualquier archivo, pasá `query` con lo que buscás — devuelve solo los fragmentos exactos relevantes con números de línea (ranking local, sin pérdida). Sin `query` devuelve el mapa estructural. MEMORIA: si el archivo ya fue leído en una sesión anterior y no cambió, devuelve solo el outline (~50 tokens); si cambió, devuelve SOLO el diff. Usá `force_full=true` si necesitás el contenido completo igual.
 2. router_bulk_process: para tareas repetitivas sobre muchos archivos o textos (clasificar, extraer campos, resumir N items) — procesa en paralelo con modelos gratuitos externos y devuelve un JSON consolidado. No usar para código crítico ni razonamiento complejo.
 3. router_checkpoint: al cerrar una tarea larga o cuando el contexto se está llenando, guardá un checkpoint (action=save) con resumen, decisiones y pendientes. Al arrancar una sesión sobre trabajo previo, action=resume lo restaura en ~300 tokens e indica qué archivos cambiaron desde entonces.
-4. router_inbox: buzón de órdenes entre clientes (Cowork/Code/Desktop). Si el usuario dice "dejale esta tarea a Claude Code" o similar: action=send con la orden y un checkpoint vinculado. AL INICIO de sesiones de trabajo, chequeá órdenes pendientes con action=check; al ejecutarlas marcá complete con el resultado.
+4. router_inbox: buzón de órdenes entre clientes (Cowork/Code/Desktop/Design). Si el usuario dice "dejale esta tarea a Claude Code", "pasale el diseño a Claude Design", "que Design haga el mockup" o similar: action=send con la orden, un checkpoint vinculado y `assets` (rutas/URLs de brief, wireframe, export .fig/.png) para el handoff código↔diseño. AL INICIO de sesiones de trabajo, chequeá órdenes pendientes con action=check; al ejecutarlas marcá complete con el resultado (y `assets` devueltos si generaste algo, ej. el export de un mockup).
 5. router_status: métricas de ahorro y diagnóstico de proveedores.
 Todas las salidas vienen en JSON minificado."""
 
@@ -209,11 +209,16 @@ class InboxInput(BaseModel):
         description="send=dejar una orden para otro cliente | check=ver órdenes pendientes | complete=marcar hecha con resultado | history=últimas completadas",
     )
     message: Optional[str] = Field(default=None, description="[send] La orden/instrucción a dejar")
-    to: Optional[str] = Field(default=None, description="[send/check] Cliente destino: 'code', 'cowork', 'desktop' o 'any' (default)")
-    from_client: Optional[str] = Field(default=None, description="[send] Quién deja la orden: 'cowork', 'code', 'desktop'")
+    to: Optional[str] = Field(default=None, description="[send/check] Cliente destino: 'code', 'cowork', 'desktop', 'design' o 'any' (default)")
+    from_client: Optional[str] = Field(default=None, description="[send] Quién deja la orden: 'cowork', 'code', 'desktop', 'design'")
     checkpoint: Optional[str] = Field(
         default=None,
         description="[send] Nombre de checkpoint vinculado — el receptor lo puede resumir para ver el contexto completo de la tarea",
+    )
+    assets: Optional[list[str]] = Field(
+        default=None,
+        description="[send/complete] Assets de handoff: rutas de archivos o URLs que acompañan la orden o el resultado "
+                    "(brief, wireframe, export .fig/.png, specs de diseño). Clave para el ida y vuelta código ↔ diseño.",
     )
     order_id: Optional[int] = Field(default=None, description="[complete] ID de la orden a marcar como hecha")
     result: Optional[str] = Field(default=None, description="[complete] Resultado/resumen de lo ejecutado, visible para quien dejó la orden")
@@ -572,7 +577,7 @@ async def router_checkpoint(params: CheckpointInput) -> str:
 @mcp.tool(
     name="router_inbox",
     annotations={
-        "title": "Inbox de Órdenes entre Clientes (Cowork ↔ Code ↔ Desktop)",
+        "title": "Inbox de Órdenes entre Clientes (Cowork ↔ Code ↔ Desktop ↔ Design)",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
@@ -581,15 +586,17 @@ async def router_checkpoint(params: CheckpointInput) -> str:
 )
 async def router_inbox(params: InboxInput) -> str:
     """
-    Buzón asíncrono entre clientes de Claude. Los chats no pueden comandarse
-    en tiempo real, pero comparten este disco: acá un cliente deja órdenes
-    y otro las consume, ejecuta y reporta.
+    Buzón asíncrono entre clientes de Claude (Cowork, Code, Desktop y Claude
+    Design). Los chats no pueden comandarse en tiempo real, pero comparten este
+    disco: acá un cliente deja órdenes y otro las consume, ejecuta y reporta.
 
-    send: dejá una orden (ej. desde Cowork para Claude Code), opcionalmente
-          vinculada a un checkpoint para que el receptor tenga todo el contexto.
+    send: dejá una orden (ej. desde Cowork para Claude Code, o entre Code y
+          Design), opcionalmente vinculada a un checkpoint y con `assets`
+          (rutas/URLs de brief, wireframe, export .fig/.png) para el handoff.
     check: al arrancar una sesión, mirá si hay órdenes pendientes para vos.
-    complete: marcá la orden hecha con un resumen del resultado.
-    history: qué se completó y con qué resultado.
+    complete: marcá la orden hecha con un resumen del resultado y, si aplica,
+          `assets` devueltos (ej. Design entrega el export del mockup).
+    history: qué se completó, con qué resultado y qué assets volvieron.
     """
     try:
         if params.action == "send":
@@ -604,10 +611,12 @@ async def router_inbox(params: InboxInput) -> str:
                 to_client=params.to or "any",
                 from_client=params.from_client or "unknown",
                 checkpoint=params.checkpoint,
+                assets=params.assets,
             )
             return _j({
                 "status": "sent", "id": oid, "to": params.to or "any",
                 "checkpoint": params.checkpoint,
+                "assets": params.assets or [],
                 "note": "el destinatario la verá con router_inbox action=check",
             })
 
@@ -632,10 +641,10 @@ async def router_inbox(params: InboxInput) -> str:
         if params.action == "complete":
             if not params.order_id:
                 return _j({"status": "error", "reason": "complete requiere `order_id`"})
-            ok = inbox.complete(params.order_id, result=params.result)
+            ok = inbox.complete(params.order_id, result=params.result, assets=params.assets)
             if not ok:
                 return _j({"status": "error", "reason": f"orden {params.order_id} no existe o ya estaba completada"})
-            return _j({"status": "completed", "id": params.order_id})
+            return _j({"status": "completed", "id": params.order_id, "result_assets": params.assets or []})
 
         # history
         return _j({"status": "ok", "completed": inbox.history()})
