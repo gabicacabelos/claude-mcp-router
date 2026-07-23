@@ -47,7 +47,7 @@ from mcp.server.fastmcp import FastMCP
 from router.cache import RouterCache
 from router.circuit_breaker import CircuitBreaker
 from router.ledger import FileLedger
-from router.providers import CheapLLM, GROQ_API_URL, GROQ_MODEL, OPENROUTER_API_URL, OPENROUTER_FREE_MODELS
+from router.providers import CheapLLM, GROQ_API_URL, GROQ_MODEL, OPENROUTER_API_URL, get_free_models
 from router.ranker import build_outline, chunk_text, rank_chunks
 from router.sanitizer import sanitize_file_content
 
@@ -96,7 +96,7 @@ _stats = {
     "diff_reads": 0,
 }
 
-VERSION = "2.1.1"
+VERSION = "2.2.0"
 
 # Umbral: archivos por debajo se devuelven enteros (el overhead de RAG no rinde)
 FULL_RETURN_MAX_TOKENS = 1500
@@ -609,8 +609,9 @@ async def router_status(params: StatusInput) -> str:
 
         or_key = os.getenv("OPENROUTER_API_KEY", "")
         if or_key:
-            diag["openrouter"] = {"models": []}
-            for model in OPENROUTER_FREE_MODELS:
+            discovered = await get_free_models()
+            diag["openrouter"] = {"discovered": len(discovered), "models": []}
+            for model in discovered[:3]:
                 try:
                     async with httpx.AsyncClient() as client:
                         r = await client.post(

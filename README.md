@@ -153,7 +153,7 @@ bulk_process ─▶ caché SHA-256 (SQLite) ──▶ CheapLLM
                                             └─ circuit breaker (no insiste con caídos)
 ```
 
-Los modelos `:free` de OpenRouter rotan constantemente: la lista vive en `router/providers.py` (`OPENROUTER_FREE_MODELS`) — verificá el catálogo vigente en openrouter.ai/models si `status(deep=true)` reporta 404s.
+Los modelos `:free` de OpenRouter rotan constantemente, así que el servidor **descubre el catálogo vivo en runtime**: consulta `openrouter.ai/api/v1/models`, filtra los de precio $0, los rankea por familia (qwen3 → llama → nemotron → ...) y cachea la lista 6 horas. Si la API no responde, cae a una lista estática de fallback. Nunca más un slug muerto hardcodeado. `status(deep=true)` muestra cuántos modelos descubrió y testea los primeros 3.
 
 ## Limitaciones conocidas
 
