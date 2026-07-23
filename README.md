@@ -4,6 +4,22 @@
 
 An MCP server that gives Claude something it doesn't have today: **memory that persists across sessions and is shared across all its clients** (Code, Desktop, Cowork, Design). It remembers which files you already read and returns only the diffs, resumes tasks where you left off, and coordinates orders between clients. 100% local, deterministic, no API keys.
 
+## What this actually does (in plain English)
+
+Claude forgets everything the moment a conversation ends, and it can't share anything between its different apps — what you told Claude Code doesn't exist for Claude Desktop. This project fixes that by keeping a small memory file on your own computer, shared by every Claude app you use.
+
+Once it's installed, in practice:
+
+- **You stop re-explaining your project every time.** Claude remembers which files it already read. Nothing changed? It skips straight to the point. Something changed? It only reads the change, not the whole file again.
+- **You can pick up work exactly where you left it — even in a different app.** Save a quick note in one Claude app, resume it from any other, decisions and pending tasks intact.
+- **You can leave a task for another app to finish.** Tell Cowork to leave a job for Claude Code; it picks it up, does it, and reports back — even though the two can't talk to each other directly.
+- **You can teach it a permanent rule, once.** *"Never use Redux in this project"* — say it once, and it shows up automatically from then on, in any app, without you repeating it.
+- **You can ask "where in my whole project is X handled?"** — not just in one file, across the entire codebase — and get the exact files and line numbers, not a guess.
+
+It never summarizes your files with another AI to save space — you always get the real, exact content. And everything stays on your machine: no accounts, no API keys, nothing sent anywhere.
+
+**Who this is for:** anyone who uses more than one Claude app (say, Claude Code *and* Claude Desktop, or Cowork) on the same project over multiple sessions. If you only ever have one quick chat at a time, this won't change much for you — and that's fine, it's not built for that.
+
 ```mermaid
 graph TD
     A[Claude Code] --> M
@@ -42,6 +58,8 @@ Claude is amnesiac across sessions and blind across clients: what you read in Cl
 
 ### `router_smart_read` — Surgical reading with memory (local, $0, no APIs)
 
+*In short: reads files smartly, remembers what it already saw, and only shows you what changed.*
+
 ```
 smart_read(file_path="docs/manual.md", query="where are webhooks configured?")
 → the 2-4 exact relevant fragments, with line numbers
@@ -60,6 +78,8 @@ smart_read(file_path="docs/manual.md", query="where are webhooks configured?")
 
 ### `router_checkpoint` — Context handoff between sessions and clients
 
+*In short: save your progress, resume it later — from any Claude app.*
+
 ```
 checkpoint(action="save", name="refactor-auth",
            summary="Login migrated to JWT, refresh token still pending",
@@ -72,6 +92,8 @@ When closing a long task (or when context is filling up), Claude saves the state
 **Cold start (no checkpoints saved):** `resume` never returns empty-handed. If nobody saved a checkpoint, it reconstructs a deterministic digest from the ledger and inbox — the last files touched (and whether they changed on disk since), plus recently completed orders. The payload declares `"mode": "reconstructed_activity"` explicitly: it's an activity trace, **not** an intentional checkpoint, and contains no architectural decisions.
 
 ### `router_inbox` — Cross-client orders
+
+*In short: leave a task for another Claude app to pick up, run, and report back on.*
 
 ```
 # In Cowork:
@@ -113,9 +135,13 @@ And the other way around: Claude Design can leave `code` an order with the final
 
 ### `router_status` — Honest session metrics
 
+*In short: check how much this is actually saving you — real numbers, no marketing.*
+
 The headline metric is `tokens_kept_out_of_context`: tokens from the original sources that **didn't** enter Claude's context window. It also reports reads, memory hits (unchanged/diff), ledger state, and pending inbox orders. `deep=true` adds local diagnostics (fastembed/python).
 
 ### `router_project_search` — Search the whole project (incremental BM25)
+
+*In short: "where in my whole project is X?" — answered with the exact file and line, not a guess.*
 
 ```
 project_search(project_dir="/proj", query="where are webhook signatures validated?")
@@ -130,6 +156,8 @@ project_search(project_dir="/proj", query="where are webhook signatures validate
 - Deliberately bounded: skips `node_modules`, `.git`, `dist`, binaries and files >400KB. Deterministic, 100% local — exact fragments, never summaries.
 
 ### `router_rules` — Permanent project rules, with provenance
+
+*In short: teach it a rule once ("never use Redux"), and it remembers, everywhere, forever.*
 
 ```
 rules(action="add", project_dir="/proj", text="never use Redux", from_client="code")
