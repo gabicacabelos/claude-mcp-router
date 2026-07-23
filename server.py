@@ -109,12 +109,78 @@ VERSION = "3.0.0"
 FULL_RETURN_MAX_TOKENS = 1500
 
 
+# ─── Config en caliente (router_config.json, opcional) ───────────────────────
+# Si el archivo NO existe aplican estos defaults (zero-config). Si existe, se
+# re-parsea solo cuando cambia el mtime → ajustar un tunable NO pide reiniciar.
+
+_CONFIG_PATH = _server_dir / "router_config.json"
+_CONFIG_DEFAULTS = {
+    "full_return_max_tokens": FULL_RETURN_MAX_TOKENS,
+    "default_top_k": 4,
+    "diff_max_ratio": 0.6,
+    "cache_enabled": True,
+}
+_config_cache: dict = {"mtime": None, "cfg": dict(_CONFIG_DEFAULTS)}
+
+
+def _load_config() -> dict:
+    """Config live-editable: stat + re-parse solo si cambió el mtime."""
+    try:
+        if not _CONFIG_PATH.exists():
+            if _config_cache["mtime"] is not None:
+                _config_cache["mtime"] = None
+                _config_cache["cfg"] = dict(_CONFIG_DEFAULTS)
+            return _config_cache["cfg"]
+        m = _CONFIG_PATH.stat().st_mtime
+        if m != _config_cache["mtime"]:
+            data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+            cfg = dict(_CONFIG_DEFAULTS)
+            for k in _CONFIG_DEFAULTS:
+                if k in data:
+                    cfg[k] = data[k]
+            _config_cache["mtime"] = m
+            _config_cache["cfg"] = cfg
+            logger.info(f"router_config.json recargado: {cfg}")
+    except Exception as e:
+        logger.warning(f"router_config.json inválido: {e} — usando la última config buena")
+    return _config_cache["cfg"]
+
+
+# ─── Staleness throttled para todas las tools ────────────────────────────────
+# El chequeo de mtimes corre como máximo una vez cada STALE_CHECK_INTERVAL_S;
+# entre medio se sirve el resultado cacheado (overhead casi nulo por llamada).
+
+STALE_CHECK_INTERVAL_S = 5.0
+_stale_cache: dict = {"ts": 0.0, "result": None}
+
+
+def _stale_throttled() -> dict | None:
+    now = time.time()
+    if now - _stale_cache["ts"] >= STALE_CHECK_INTERVAL_S:
+        _stale_cache["result"] = _code_staleness(_stats["start_time"])
+        _stale_cache["ts"] = now
+    return _stale_cache["result"]
+
+
 def _tokens(text: str) -> int:
     return len(text) // 4
 
 
 def _j(obj) -> str:
-    """JSON minificado — política global: ni un token regalado."""
+    """
+    JSON minificado — política global: ni un token regalado.
+    Si el código en disco cambió después del boot, inyecta `code_stale` en el
+    payload de CUALQUIER tool (cero sorpresas: el campo se OMITE por completo
+    cuando no hay staleness; router_status ya trae su campo propio y se saltea).
+    """
+    if isinstance(obj, dict) and "code_staleness" not in obj:
+        st = _stale_throttled()
+        if st and st.get("stale"):
+            obj["code_stale"] = {
+                "changed_file": st.get("changed_file"),
+                "changed_ago_s": st.get("changed_ago_s"),
+                "hint": "código nuevo en disco sin aplicar — reconectá el MCP para aplicarlo",
+            }
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -152,7 +218,10 @@ class SmartReadInput(BaseModel):
         default=None,
         description="Qué buscás en el archivo (ej: '¿dónde se configuran los webhooks?'). Si se omite y el archivo es grande, se devuelve el mapa estructural.",
     )
-    top_k: int = Field(default=4, ge=1, le=10, description="Cantidad de fragmentos a devolver")
+    top_k: Optional[int] = Field(
+        default=None, ge=1, le=10,
+        description="Cantidad de fragmentos a devolver (default: default_top_k de la config, 4 si no hay config)",
+    )
     force_full: bool = Field(
         default=False,
         description="True = ignorar la memoria de lecturas previas y devolver contenido completo/mapa",
@@ -235,6 +304,7 @@ async def router_smart_read(params: SmartReadInput) -> str:
       diff unificado. force_full=true para saltear la memoria.
     - HTML: se limpia localmente (scripts/tags fuera) antes de procesar.
     """
+    cfg = _load_config()
     fp = Path(params.file_path)
     if not fp.exists() or not fp.is_file():
         return _j({"status": "error", "reason": f"no existe: {params.file_path}"})
@@ -278,7 +348,7 @@ async def router_smart_read(params: SmartReadInput) -> str:
                 "hint": "sin cambios desde la última lectura — usá `query` para fragmentos o `force_full=true` para el contenido completo",
             })
         if entry["snapshot"]:
-            diff = ledger.diff(entry["snapshot"], content)
+            diff = ledger.diff(entry["snapshot"], content, max_ratio=cfg["diff_max_ratio"])
             outline = build_outline(content)
             ledger.record(key, content, outline, tok_clean)
             if diff is not None:
@@ -298,7 +368,7 @@ async def router_smart_read(params: SmartReadInput) -> str:
             entry = None
 
     # Chico → entero
-    if tok_clean <= FULL_RETURN_MAX_TOKENS:
+    if tok_clean <= cfg["full_return_max_tokens"]:
         _stats["tokens_delivered"] += tok_clean
         _ledger_safe_record(key, content, tok_clean)
         return _j({"status": "full", **base, "content": content})
@@ -306,15 +376,17 @@ async def router_smart_read(params: SmartReadInput) -> str:
     # Grande + query → chunks exactos rankeados localmente (con cache por hash+query)
     if params.query:
         _ledger_safe_record(key, content, tok_clean)
+        top_k = params.top_k or cfg["default_top_k"]
+        cache_on = bool(cfg["cache_enabled"]) and not params.force_full
         new_hash = FileLedger.hash(content)
         q_norm = FileLedger.normalize_query(params.query)
 
         # Cache HIT: query repetida sobre archivo sin cambios → releer esas líneas,
         # sin re-chunkear ni re-rankear. Invalidación automática por hash.
-        if not params.force_full:
+        if cache_on:
             cached = None
             try:
-                cached = ledger.get_query_cache(new_hash, q_norm, params.top_k)
+                cached = ledger.get_query_cache(new_hash, q_norm, top_k)
             except Exception as e:
                 logger.warning(f"query cache get falló: {e}")
             if cached:
@@ -337,11 +409,12 @@ async def router_smart_read(params: SmartReadInput) -> str:
                     "note": "fragmentos EXACTOS del archivo (cache) — para más contexto repetir con otra query o top_k mayor",
                 })
 
-        top, engine = rank_chunks(content, params.query, top_k=params.top_k,
-                                  file_hash=new_hash, vector_store=ledger)
-        if not params.force_full:
+        top, engine = rank_chunks(content, params.query, top_k=top_k,
+                                  file_hash=new_hash,
+                                  vector_store=ledger if cfg["cache_enabled"] else None)
+        if cache_on:
             try:
-                ledger.put_query_cache(new_hash, q_norm, params.top_k,
+                ledger.put_query_cache(new_hash, q_norm, top_k,
                                        [(c.start_line, c.end_line) for c in top])
             except Exception as e:
                 logger.warning(f"query cache put falló: {e}")

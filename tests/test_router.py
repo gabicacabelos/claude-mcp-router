@@ -673,3 +673,139 @@ def test_smart_read_force_full_bypasses_query_cache(server_module, tmp_path, mon
     r = _smart_read(server_module, file_path=str(f), query="quokka", top_k=2, force_full=True)
     assert r["cache_hit"] is False
     led.close()
+
+
+# ─── server: config en caliente (router_config.json) ─────────────────────────
+
+@pytest.fixture
+def config_at(server_module, tmp_path, monkeypatch):
+    """Apunta _CONFIG_PATH a un tmp y resetea el cache de config (antes y después)."""
+    path = tmp_path / "router_config.json"
+    monkeypatch.setattr(server_module, "_CONFIG_PATH", path)
+    server_module._config_cache["mtime"] = None
+    server_module._config_cache["cfg"] = dict(server_module._CONFIG_DEFAULTS)
+    yield path
+    server_module._config_cache["mtime"] = None
+    server_module._config_cache["cfg"] = dict(server_module._CONFIG_DEFAULTS)
+
+
+def test_config_defaults_without_file(server_module, config_at):
+    # (a) sin archivo → defaults exactos
+    cfg = server_module._load_config()
+    assert cfg == server_module._CONFIG_DEFAULTS
+    assert cfg["full_return_max_tokens"] == 1500
+    assert cfg["default_top_k"] == 4
+    assert cfg["diff_max_ratio"] == 0.6
+    assert cfg["cache_enabled"] is True
+
+
+def test_config_file_overrides_value(server_module, config_at):
+    # (b) el archivo overridea solo lo que declara; claves desconocidas se ignoran
+    config_at.write_text(json.dumps({"default_top_k": 7, "clave_desconocida": 1}), encoding="utf-8")
+    cfg = server_module._load_config()
+    assert cfg["default_top_k"] == 7
+    assert cfg["full_return_max_tokens"] == 1500, "lo no declarado mantiene su default"
+    assert "clave_desconocida" not in cfg
+
+
+def test_config_mtime_change_is_picked_up_without_reimport(server_module, config_at):
+    # (c) editar el archivo se toma en la siguiente llamada, sin reimportar el módulo
+    import os
+    config_at.write_text(json.dumps({"default_top_k": 5}), encoding="utf-8")
+    assert server_module._load_config()["default_top_k"] == 5
+
+    config_at.write_text(json.dumps({"default_top_k": 9}), encoding="utf-8")
+    os.utime(config_at, (time.time() + 10, time.time() + 10))  # mtime inequívocamente distinto
+    assert server_module._load_config()["default_top_k"] == 9
+
+
+def test_config_invalid_json_keeps_last_good(server_module, config_at):
+    import os
+    config_at.write_text(json.dumps({"default_top_k": 6}), encoding="utf-8")
+    assert server_module._load_config()["default_top_k"] == 6
+    config_at.write_text("{esto no es json", encoding="utf-8")
+    os.utime(config_at, (time.time() + 10, time.time() + 10))
+    assert server_module._load_config()["default_top_k"] == 6, "config rota no debe tirar los valores buenos"
+
+
+def test_smart_read_cache_disabled_via_config(server_module, tmp_path, monkeypatch, config_at):
+    # (d) cache_enabled=false → nunca hay cache_hit aunque se repita la query
+    led = FileLedger(str(tmp_path / "led4.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    config_at.write_text(json.dumps({"cache_enabled": False}), encoding="utf-8")
+    f = tmp_path / "big4.py"
+    f.write_text(_make_sectioned_text(8, 40, keyword_section=3, keyword="quokka"), encoding="utf-8")
+
+    assert _smart_read(server_module, file_path=str(f), query="quokka", top_k=2)["cache_hit"] is False
+    assert _smart_read(server_module, file_path=str(f), query="quokka", top_k=2)["cache_hit"] is False
+    led.close()
+
+
+def test_smart_read_default_top_k_comes_from_config(server_module, tmp_path, monkeypatch, config_at):
+    led = FileLedger(str(tmp_path / "led5.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    config_at.write_text(json.dumps({"default_top_k": 2}), encoding="utf-8")
+    f = tmp_path / "big5.py"
+    f.write_text(_make_sectioned_text(8, 40, keyword_section=3, keyword="quokka"), encoding="utf-8")
+
+    r = _smart_read(server_module, file_path=str(f), query="quokka")  # sin top_k explícito
+    assert r["status"] == "chunks"
+    assert len(r["chunks"]) == 2, "sin top_k explícito debe usar default_top_k de la config"
+    led.close()
+
+
+# ─── server: code_stale inyectado en todas las tools (throttled) ──────────────
+
+@pytest.fixture
+def fresh_stale_cache(server_module):
+    """Resetea el throttle de staleness antes y después de cada test."""
+    server_module._stale_cache["ts"] = 0.0
+    server_module._stale_cache["result"] = None
+    yield
+    server_module._stale_cache["ts"] = 0.0
+    server_module._stale_cache["result"] = None
+
+
+def test_smart_read_payload_has_code_stale_when_boot_is_old(
+        server_module, tmp_path, monkeypatch, fresh_stale_cache):
+    # (e) boot "viejo" → cualquier tool avisa code_stale en su payload
+    led = FileLedger(str(tmp_path / "led6.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    monkeypatch.setitem(server_module._stats, "start_time", 0.0)
+    f = tmp_path / "chico.py"
+    f.write_text("print('hola')", encoding="utf-8")
+
+    r = _smart_read(server_module, file_path=str(f))
+    assert "code_stale" in r
+    assert r["code_stale"]["changed_file"] is not None
+    assert "reconect" in r["code_stale"]["hint"]
+    led.close()
+
+
+def test_smart_read_payload_omits_code_stale_when_fresh(
+        server_module, tmp_path, monkeypatch, fresh_stale_cache):
+    # (f) CERO SORPRESAS: boot reciente (código sin cambios después) → el campo NO existe
+    led = FileLedger(str(tmp_path / "led7.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    monkeypatch.setitem(server_module._stats, "start_time", time.time() + 3600)
+    f = tmp_path / "chico2.py"
+    f.write_text("print('hola')", encoding="utf-8")
+
+    r = _smart_read(server_module, file_path=str(f))
+    assert "code_stale" not in r, "en operación normal el campo no debe existir en la respuesta"
+    led.close()
+
+
+def test_stale_check_is_throttled(server_module, monkeypatch, fresh_stale_cache):
+    # El chequeo de mtimes corre 1 vez por ventana; entre medio sirve el cache
+    calls = {"n": 0}
+    real = server_module._code_staleness
+
+    def counting(boot):
+        calls["n"] += 1
+        return real(boot)
+
+    monkeypatch.setattr(server_module, "_code_staleness", counting)
+    for _ in range(10):
+        server_module._stale_throttled()
+    assert calls["n"] == 1, "10 llamadas dentro de la ventana deben statear archivos una sola vez"

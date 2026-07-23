@@ -157,7 +157,8 @@ class FileLedger:
         )
         self._db.commit()
 
-    def diff(self, old: str, new: str, context_lines: int = 2) -> str | None:
+    def diff(self, old: str, new: str, context_lines: int = 2,
+             max_ratio: float = DIFF_MAX_RATIO) -> str | None:
         """
         Diff unificado old→new. Devuelve None si el diff no rinde
         (muy grande respecto al archivo) — en ese caso conviene contenido normal.
@@ -170,7 +171,7 @@ class FileLedger:
         )
         if not d:
             return ""
-        if len(d) > len(new) * DIFF_MAX_RATIO:
+        if len(d) > len(new) * max_ratio:
             return None
         return d
 

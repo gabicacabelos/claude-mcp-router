@@ -185,7 +185,20 @@ Todo local: el ledger y el inbox son SQLite en disco; los checkpoints son JSON l
 
 Cada cliente lanza `server.py` como un proceso propio y lo mantiene vivo mientras dura la sesión. Editar el código en disco — o hacer `git pull`/`git push` — **no** afecta a un proceso que ya está corriendo: Python no recarga módulos solo. Si cambiaste algo y el comportamiento nuevo no aparece, no es un bug: reiniciá el MCP (reconectar en `/mcp` o reiniciar el cliente).
 
-Para no tener que inferir eso a mano, `router_status` incluye `code_staleness`: compara la fecha de modificación de `server.py`/`router/*.py` contra el momento en que el proceso arrancó, y devuelve `{"stale": true, "changed_file": "...", "hint": "..."}` si el disco cambió después del boot. Chequealo si algo no se comporta como esperás tras editar código.
+Para no tener que inferir eso a mano, `router_status` incluye `code_staleness`: compara la fecha de modificación de `server.py`/`router/*.py` contra el momento en que el proceso arrancó, y devuelve `{"stale": true, "changed_file": "...", "hint": "..."}` si el disco cambió después del boot. Además, cuando hay staleness, **todas** las tools inyectan un campo `code_stale` en su respuesta (con el archivo cambiado y un hint) — te enterás en la primera llamada que hagas, sin tener que acordarte de consultar `router_status`. En operación normal el campo no existe: solo aparece si el código realmente cambió en disco después del boot.
+
+## Configuración en caliente (`router_config.json`)
+
+Los tunables de runtime se pueden ajustar **sin reiniciar el MCP**. Copiá `router_config.example.json` a `router_config.json` (junto a `server.py`, está gitignored) y editá lo que necesites — la siguiente llamada a cualquier tool lo toma (el archivo se re-parsea solo cuando cambia su fecha de modificación, overhead casi nulo):
+
+| Clave | Default | Qué controla |
+|---|---|---|
+| `full_return_max_tokens` | `1500` | Umbral por debajo del cual un archivo se devuelve entero |
+| `default_top_k` | `4` | Fragmentos a devolver cuando la llamada no pasa `top_k` |
+| `diff_max_ratio` | `0.6` | Si el diff pesa más que esta fracción del archivo, no rinde y se devuelve contenido normal |
+| `cache_enabled` | `true` | Cache de query→fragmentos y de vectores de embeddings |
+
+Si `router_config.json` no existe, aplican los defaults (zero-config). Cambios de **lógica** (código nuevo en `server.py`/`router/`) sí siguen pidiendo reinicio — eso es inevitable; la config en caliente solo elimina los reinicios por ajuste de tunables.
 
 ## Limitaciones conocidas
 

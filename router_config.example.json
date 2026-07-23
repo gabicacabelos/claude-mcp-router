@@ -1,0 +1,7 @@
+{
+  "_comment": "Copiá este archivo a router_config.json para ajustar tunables SIN reiniciar el MCP. Si router_config.json no existe, aplican estos defaults.",
+  "full_return_max_tokens": 1500,
+  "default_top_k": 4,
+  "diff_max_ratio": 0.6,
+  "cache_enabled": true
+}

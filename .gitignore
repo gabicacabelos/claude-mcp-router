@@ -1,6 +1,9 @@
 # Credenciales — NUNCA subir al repo
 .env
 
+# Config local en caliente (el example sí se commitea)
+router_config.json
+
 # Caché local del router
 cache/
 *.db
