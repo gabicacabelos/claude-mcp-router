@@ -1,0 +1,36 @@
+1
+00:00:00,000 --> 00:00:04,000
+Un MCP que le da a Claude memoria de tus archivos entre sesiones, para gastar muchos menos tokens.
+
+2
+00:00:04,000 --> 00:00:09,199
+Cada sesión nueva, Claude arranca en blanco: vuelve a leer los mismos archivos enteros y pagás los mismos tokens una y otra vez.
+
+3
+00:00:09,199 --> 00:00:12,599
+smart_read le da memoria: la primera vez guarda una huella del archivo en disco.
+
+4
+00:00:12,599 --> 00:00:17,199
+Si el archivo no cambió, en vez de releerlo entero devuelve un resumen de 90 tokens. Misma fidelidad, 99% menos gasto.
+
+5
+00:00:17,199 --> 00:00:21,000
+Y si cambió, devuelve solo las líneas nuevas —el diff— no el archivo completo.
+
+6
+00:00:21,000 --> 00:00:26,000
+Al cerrar una tarea larga guardás un checkpoint. Otra sesión —o incluso otro cliente: Code, Cowork, Desktop o Claude Design— lo retoma en 298 tokens.
+
+7
+00:00:26,000 --> 00:00:31,000
+El inbox conecta tus clientes: desde Cowork dejás una orden, Claude Code la ejecuta al arrancar y te devuelve el resultado. Sin compartir chat.
+
+8
+00:00:31,000 --> 00:00:37,200
+Y se suma Claude Design al pack: Code le manda una orden con el brief y el wireframe como assets; Design devuelve el mockup exportado. El handoff viaja con el material, no solo el texto.
+
+9
+00:00:37,200 --> 00:00:41,800
+Todo esto es local, sin API keys para las funciones núcleo, y open source con licencia MIT.
+
