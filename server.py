@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-INDIVIDRA MCP — Context Ingestion & Bulk Offload Engine  (v2.0.0)
+INDIVIDRA MCP — Memoria y continuidad para Claude entre sesiones y clientes  (v3.0.0)
 
-3 herramientas de alto impacto:
-  router_smart_read    → Lectura quirúrgica de archivos grandes (Mini-RAG local, $0)
-  router_bulk_process  → Offload masivo de tareas repetitivas a modelos gratuitos
-  router_status        → Estado, métricas honestas y diagnóstico de proveedores
+4 herramientas de alto impacto — 100% locales, sin API keys:
+  router_smart_read  → Lectura quirúrgica de archivos grandes con memoria cross-sesión
+  router_checkpoint  → Handoff de contexto entre sesiones y clientes (~300 tokens)
+  router_inbox       → Órdenes asíncronas entre clientes (Cowork/Code/Desktop/Design)
+  router_status      → Estado y métricas honestas de la sesión
 
-Filosofía v2:
-  - El ahorro real está en NO meter archivos de 20k tokens al contexto de Claude,
-    no en resumirlos con pérdida usando modelos débiles.
-  - smart_read es determinista y local: devuelve los chunks EXACTOS del archivo.
-  - bulk_process delega trabajo repetitivo (clasificar/extraer sobre N items)
-    donde los modelos gratis sí rinden, con failover transparente.
+Filosofía:
+  - Lo que ningún cliente de Claude hace: recordar qué archivos ya leíste y devolver
+    solo los diffs. El valor es la continuidad, no un "ahorro mágico de tokens".
+  - smart_read es determinista y local: devuelve los chunks EXACTOS del archivo,
+    nunca resúmenes con pérdida generados por un modelo débil.
+  - checkpoint + inbox comparten estado en disco entre todos tus clientes.
   - Todas las salidas van minificadas: ni un token regalado.
+
+Nota: el procesamiento masivo en modelos gratuitos (antes router_bulk_process) se
+separó a su propio repo, `individra-bulk-offload`, porque es otro producto y
+dependía de servicios externos que diluían este núcleo 100% local.
 
 ─────────────────────────────────────────────
 claude_desktop_config.json (o `claude mcp add --scope user`):
@@ -22,14 +27,12 @@ claude_desktop_config.json (o `claude mcp add --scope user`):
   "mcpServers": {
     "individra-router": {
       "command": "python",
-      "args": ["C:/ruta/a/individra-mcp-router/server.py"],
-      "env": {"GROQ_API_KEY": "...", "OPENROUTER_API_KEY": "..."}
+      "args": ["C:/ruta/a/individra-mcp-router/server.py"]
     }
   }
 }
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -38,17 +41,11 @@ import time
 from pathlib import Path
 from typing import Literal, Optional
 
-import httpx
-import yaml
-from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 from mcp.server.fastmcp import FastMCP
 
-from router.cache import RouterCache
-from router.circuit_breaker import CircuitBreaker
 from router.inbox import Inbox
 from router.ledger import FileLedger
-from router.providers import CheapLLM, GROQ_API_URL, GROQ_MODEL, OPENROUTER_API_URL, get_free_models
 from router.ranker import build_outline, chunk_text, rank_chunks
 from router.sanitizer import sanitize_file_content
 
@@ -57,13 +54,6 @@ from router.sanitizer import sanitize_file_content
 # ─────────────────────────────────────────────
 
 _server_dir = Path(__file__).parent
-load_dotenv(_server_dir / ".env", override=True)
-
-_config_path = _server_dir / "router_config.yaml"
-CONFIG: dict = {}
-if _config_path.exists():
-    with open(_config_path) as f:
-        CONFIG = yaml.safe_load(f) or {}
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -71,16 +61,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("individra-mcp")
 
-cache = RouterCache(
-    db_path=str(_server_dir / "cache" / "router_cache.db"),
-    ttl_static=CONFIG.get("cache", {}).get("ttl_static_seconds", 86400),
-    ttl_dynamic=CONFIG.get("cache", {}).get("ttl_dynamic_seconds", 3600),
-)
-circuit_breaker = CircuitBreaker(
-    failure_threshold=CONFIG.get("circuit_breaker", {}).get("failure_threshold", 4),
-    reset_timeout_seconds=CONFIG.get("circuit_breaker", {}).get("reset_timeout_seconds", 180),
-)
-llm = CheapLLM(circuit_breaker=circuit_breaker)
 ledger = FileLedger(db_path=str(_server_dir / "cache" / "ledger.db"))
 inbox = Inbox(db_path=str(_server_dir / "cache" / "inbox.db"))
 _checkpoints_dir = _server_dir / "checkpoints"
@@ -90,20 +70,14 @@ _stats = {
     "smart_reads": 0,
     "tokens_file_total": 0,      # tokens de los archivos originales pedidos
     "tokens_delivered": 0,       # tokens que efectivamente entraron al contexto de Claude
-    "bulk_items_processed": 0,
-    "bulk_items_failed": 0,
-    "cache_hits": 0,
-    "api_calls": 0,
     "unchanged_hits": 0,
     "diff_reads": 0,
 }
 
-VERSION = "2.3.0"
+VERSION = "3.0.0"
 
 # Umbral: archivos por debajo se devuelven enteros (el overhead de RAG no rinde)
 FULL_RETURN_MAX_TOKENS = 1500
-BULK_ITEM_MAX_CHARS = 12000
-BULK_MAX_CONCURRENCY = 4
 
 
 def _tokens(text: str) -> int:
@@ -127,12 +101,11 @@ def _ledger_safe_record(key: str, content: str, tokens: int, outline: list[str] 
 # FastMCP + instructions (auto-activación)
 # ─────────────────────────────────────────────
 
-INSTRUCTIONS = """Suite de ingesta de contexto y procesamiento masivo con memoria cross-sesión. Usala PROACTIVAMENTE para proteger tu ventana de contexto:
+INSTRUCTIONS = """Memoria y continuidad para Claude entre sesiones y clientes — 100% local, sin API keys. Usala PROACTIVAMENTE para proteger tu ventana de contexto y no re-explorar trabajo previo:
 1. router_smart_read: para leer un archivo grande (>15KB) o buscar algo puntual en cualquier archivo, pasá `query` con lo que buscás — devuelve solo los fragmentos exactos relevantes con números de línea (ranking local, sin pérdida). Sin `query` devuelve el mapa estructural. MEMORIA: si el archivo ya fue leído en una sesión anterior y no cambió, devuelve solo el outline (~50 tokens); si cambió, devuelve SOLO el diff. Usá `force_full=true` si necesitás el contenido completo igual.
-2. router_bulk_process: para tareas repetitivas sobre muchos archivos o textos (clasificar, extraer campos, resumir N items) — procesa en paralelo con modelos gratuitos externos y devuelve un JSON consolidado. No usar para código crítico ni razonamiento complejo.
-3. router_checkpoint: al cerrar una tarea larga o cuando el contexto se está llenando, guardá un checkpoint (action=save) con resumen, decisiones y pendientes. Al arrancar una sesión sobre trabajo previo, action=resume lo restaura en ~300 tokens e indica qué archivos cambiaron desde entonces.
-4. router_inbox: buzón de órdenes entre clientes (Cowork/Code/Desktop/Design). Si el usuario dice "dejale esta tarea a Claude Code", "pasale el diseño a Claude Design", "que Design haga el mockup" o similar: action=send con la orden, un checkpoint vinculado y `assets` (rutas/URLs de brief, wireframe, export .fig/.png) para el handoff código↔diseño. AL INICIO de sesiones de trabajo, chequeá órdenes pendientes con action=check; al ejecutarlas marcá complete con el resultado (y `assets` devueltos si generaste algo, ej. el export de un mockup).
-5. router_status: métricas de ahorro y diagnóstico de proveedores.
+2. router_checkpoint: al cerrar una tarea larga o cuando el contexto se está llenando, guardá un checkpoint (action=save) con resumen, decisiones y pendientes. Al arrancar una sesión sobre trabajo previo, action=resume lo restaura en ~300 tokens e indica qué archivos cambiaron desde entonces.
+3. router_inbox: buzón de órdenes entre clientes (Cowork/Code/Desktop/Design). Si el usuario dice "dejale esta tarea a Claude Code", "pasale el diseño a Claude Design", "que Design haga el mockup" o similar: action=send con la orden, un checkpoint vinculado y `assets` (rutas/URLs de brief, wireframe, export .fig/.png) para el handoff código↔diseño. AL INICIO de sesiones de trabajo, chequeá órdenes pendientes con action=check; al ejecutarlas marcá complete con el resultado (y `assets` devueltos si generaste algo, ej. el export de un mockup).
+4. router_status: métricas de la sesión (tokens que no entraron al contexto, lecturas, checkpoints, inbox).
 Todas las salidas vienen en JSON minificado."""
 
 mcp = FastMCP("individra_router_mcp", instructions=INSTRUCTIONS)
@@ -154,30 +127,6 @@ class SmartReadInput(BaseModel):
     force_full: bool = Field(
         default=False,
         description="True = ignorar la memoria de lecturas previas y devolver contenido completo/mapa",
-    )
-
-
-class BulkProcessInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    items: list[str] = Field(
-        ...,
-        min_length=1,
-        max_length=100,
-        description="Lista de rutas de archivo o textos crudos a procesar",
-    )
-    instruction: str = Field(
-        ...,
-        min_length=10,
-        description="Qué hacer con cada item (ej: 'extraé remitente, fecha y monto de esta factura')",
-    )
-    output_schema: Optional[str] = Field(
-        default=None,
-        description="Esquema JSON deseado por item (ej: '{\"sender\":str,\"amount\":float}')",
-    )
-    mode: Literal["map", "map_reduce"] = Field(
-        default="map",
-        description="map=resultado por item | map_reduce=además consolida todo en un resumen final",
     )
 
 
@@ -362,115 +311,7 @@ async def router_smart_read(params: SmartReadInput) -> str:
 
 
 # ─────────────────────────────────────────────
-# Tool 2: bulk_process — Offload masivo con failover transparente
-# ─────────────────────────────────────────────
-
-@mcp.tool(
-    name="router_bulk_process",
-    annotations={
-        "title": "Procesamiento Masivo en Modelos Gratuitos",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def router_bulk_process(params: BulkProcessInput) -> str:
-    """
-    Procesa N archivos o textos en paralelo contra modelos gratuitos (Groq → OpenRouter)
-    y devuelve un único JSON consolidado. Claude no ve los contenidos originales:
-    solo el resultado final estructurado.
-
-    Ideal para: clasificar lotes, extraer campos de facturas/emails/transcripciones,
-    resumir muchos documentos, mapear datos no estructurados a un esquema.
-    NO usar para: código crítico, decisiones arquitecturales, razonamiento complejo.
-
-    Failover transparente: si un proveedor cae, rota al siguiente; si todos fallan
-    para un item, el item se reporta como fallido sin romper el lote.
-    Caché SHA-256: mismo item + misma instrucción = resultado instantáneo sin API.
-    """
-    await cache.init()
-
-    schema_part = f"\nRespondé EXACTAMENTE con este esquema JSON:\n{params.output_schema}" if params.output_schema else ""
-    sem = asyncio.Semaphore(BULK_MAX_CONCURRENCY)
-
-    def load_item(item: str) -> tuple[str, str]:
-        """Returns (nombre, contenido). Si parece ruta y existe, lee el archivo."""
-        if len(item) < 500:
-            p = Path(item)
-            try:
-                if p.is_file():
-                    raw = p.read_text(encoding="utf-8", errors="replace")
-                    clean, _ = sanitize_file_content(raw, str(p))
-                    return p.name, clean
-            except Exception:
-                pass
-        return f"text_{abs(hash(item)) % 10000}", item
-
-    async def process(idx: int, item: str) -> dict:
-        name, content = load_item(item)
-        if len(content) > BULK_ITEM_MAX_CHARS:
-            content = content[:BULK_ITEM_MAX_CHARS] + "\n[...truncado]"
-
-        prompt = (
-            f"{params.instruction}{schema_part}\n"
-            "Respondé SOLO con el resultado, sin introducción ni explicación.\n"
-            f"---\n{content}"
-        )
-        cache_key = RouterCache.hash(prompt)
-        cached = await cache.get(cache_key)
-        if cached:
-            _stats["cache_hits"] += 1
-            return {"i": idx, "src": name, "out": cached, "provider": "cache"}
-
-        async with sem:
-            result, provider = await llm.call(
-                prompt, max_tokens=1500, json_mode=bool(params.output_schema)
-            )
-        if result is None:
-            _stats["bulk_items_failed"] += 1
-            return {"i": idx, "src": name, "error": "todos los proveedores fallaron"}
-
-        _stats["api_calls"] += 1
-        _stats["bulk_items_processed"] += 1
-        _stats["tokens_file_total"] += _tokens(content)
-        await cache.set(cache_key, result, provider=provider)
-        return {"i": idx, "src": name, "out": result, "provider": provider}
-
-    results = await asyncio.gather(*[process(i, item) for i, item in enumerate(params.items)])
-    ok = [r for r in results if "out" in r]
-    failed = [r for r in results if "error" in r]
-
-    response = {
-        "status": "ok" if ok else "failed",
-        "processed": len(ok),
-        "failed": len(failed),
-        "results": results,
-    }
-
-    if params.mode == "map_reduce" and len(ok) > 1:
-        joined = "\n".join(f"[{r['src']}]: {r['out']}" for r in ok)[:BULK_ITEM_MAX_CHARS]
-        reduce_prompt = (
-            f"Los siguientes son resultados por-item de la tarea: '{params.instruction}'.\n"
-            "Consolidalos en un único resumen/estructura global. Respondé SOLO con el resultado.\n"
-            f"---\n{joined}"
-        )
-        reduced, provider = await llm.call(reduce_prompt, max_tokens=2000)
-        if reduced:
-            _stats["api_calls"] += 1
-            response["reduced"] = reduced
-            response["reduce_provider"] = provider
-        else:
-            response["reduced"] = None
-            response["reduce_note"] = "consolidación falló — usar resultados por item"
-
-    delivered = _tokens(_j(response))
-    _stats["tokens_delivered"] += delivered
-    return _j(response)
-
-
-# ─────────────────────────────────────────────
-# Tool 3: checkpoint — handoff de contexto entre sesiones y clientes
+# Tool 2: checkpoint — handoff de contexto entre sesiones y clientes
 # ─────────────────────────────────────────────
 
 def _safe_name(name: str) -> str:
@@ -571,7 +412,7 @@ async def router_checkpoint(params: CheckpointInput) -> str:
 
 
 # ─────────────────────────────────────────────
-# Tool 4: inbox — órdenes cruzadas entre clientes
+# Tool 3: inbox — órdenes cruzadas entre clientes
 # ─────────────────────────────────────────────
 
 @mcp.tool(
@@ -655,7 +496,7 @@ async def router_inbox(params: InboxInput) -> str:
 
 
 # ─────────────────────────────────────────────
-# Tool 5: status — métricas honestas + diagnóstico
+# Tool 4: status — métricas honestas de la sesión
 # ─────────────────────────────────────────────
 
 @mcp.tool(
@@ -670,78 +511,33 @@ async def router_inbox(params: InboxInput) -> str:
 )
 async def router_status(params: StatusInput) -> str:
     """
-    Métricas de la sesión (tokens que NO entraron al contexto de Claude, cache, llamadas)
-    y estado de circuit breakers. Con deep=true testea conectividad real de proveedores.
+    Métricas de la sesión: tokens que NO entraron al contexto de Claude, lecturas,
+    hits de memoria (unchanged/diff), estado del ledger e inbox. Con deep=true suma
+    diagnóstico local (fastembed/python).
     """
-    await cache.init()
     saved = max(0, _stats["tokens_file_total"] - _stats["tokens_delivered"])
     status = {
         "version": VERSION,
         "uptime_s": round(time.time() - _stats["start_time"]),
-        "providers": {
-            "groq": bool(os.getenv("GROQ_API_KEY")),
-            "openrouter": bool(os.getenv("OPENROUTER_API_KEY")),
-        },
-        "circuit_breakers": circuit_breaker.get_status() or None,
         "session": {
             "smart_reads": _stats["smart_reads"],
             "unchanged_hits": _stats["unchanged_hits"],
             "diff_reads": _stats["diff_reads"],
-            "bulk_processed": _stats["bulk_items_processed"],
-            "bulk_failed": _stats["bulk_items_failed"],
-            "api_calls": _stats["api_calls"],
-            "cache_hits": _stats["cache_hits"],
             "tokens_source_total": _stats["tokens_file_total"],
             "tokens_delivered_to_claude": _stats["tokens_delivered"],
             "tokens_kept_out_of_context": saved,
         },
         "ledger": ledger.stats(),
-        "cache": await cache.get_stats(),
+        "inbox_pending": len(inbox.check()),
     }
 
     if params.deep:
         diag = {}
-        groq_key = os.getenv("GROQ_API_KEY", "")
-        if groq_key:
-            try:
-                async with httpx.AsyncClient() as client:
-                    r = await client.post(
-                        GROQ_API_URL,
-                        headers={"Authorization": f"Bearer {groq_key}"},
-                        json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": "OK"}], "max_tokens": 5},
-                        timeout=15.0,
-                    )
-                diag["groq"] = {"http": r.status_code, "model": GROQ_MODEL}
-            except Exception as e:
-                diag["groq"] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
-        else:
-            diag["groq"] = {"error": "GROQ_API_KEY no configurada"}
-
-        or_key = os.getenv("OPENROUTER_API_KEY", "")
-        if or_key:
-            discovered = await get_free_models()
-            diag["openrouter"] = {"discovered": len(discovered), "models": []}
-            for model in discovered[:3]:
-                try:
-                    async with httpx.AsyncClient() as client:
-                        r = await client.post(
-                            OPENROUTER_API_URL,
-                            headers={"Authorization": f"Bearer {or_key}"},
-                            json={"model": model, "messages": [{"role": "user", "content": "OK"}], "max_tokens": 5},
-                            timeout=20.0,
-                        )
-                    diag["openrouter"]["models"].append({"m": model, "http": r.status_code})
-                except Exception as e:
-                    diag["openrouter"]["models"].append({"m": model, "error": str(e)[:100]})
-        else:
-            diag["openrouter"] = {"error": "OPENROUTER_API_KEY no configurada"}
-
         try:
             from router.ranker import _get_embedder
             diag["fastembed"] = "activo" if _get_embedder() else "no instalado (BM25 puro)"
         except Exception:
             diag["fastembed"] = "no instalado (BM25 puro)"
-
         diag["python"] = sys.version.split()[0]
         status["diagnostics"] = diag
 
@@ -753,5 +549,5 @@ async def router_status(params: StatusInput) -> str:
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logger.info(f"INDIVIDRA MCP v{VERSION} — Context Ingestion & Bulk Offload Engine ✓")
+    logger.info(f"INDIVIDRA MCP v{VERSION} — memoria y continuidad para Claude ✓")
     mcp.run()

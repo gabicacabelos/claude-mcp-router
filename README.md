@@ -1,25 +1,27 @@
-# INDIVIDRA MCP — Context Ingestion & Bulk Offload Engine
+# INDIVIDRA MCP — Memoria persistente y compartida para Claude
 
-MCP server que protege la ventana de contexto de Claude con tres estrategias que **sí funcionan**: lectura quirúrgica de archivos grandes (Mini-RAG 100% local, sin pérdida de fidelidad), **memoria de ingesta cross-sesión** (lo que ningún cliente de Claude hace: recordar qué archivos ya leíste y devolver solo los diffs), y offload de trabajo masivo/repetitivo a modelos gratuitos externos.
+MCP server que le da a Claude algo que hoy no tiene: **memoria que persiste entre sesiones y se comparte entre todos sus clientes** (Code, Desktop, Cowork, Design). Recuerda qué archivos ya leíste y devuelve solo los diffs, retoma tareas donde las dejaste, y coordina órdenes entre clientes. 100% local, determinista, sin API keys.
 
 ## Por qué existe
 
-Claude es amnésico entre sesiones y ciego entre clientes: lo que leíste en Claude Code no existe para Claude Desktop, y cada sesión nueva re-lee los mismos archivos quemando miles de tokens. Este MCP es el mismo proceso local compartido por todos tus clientes, con estado persistente en disco — puede ser la memoria que Claude no tiene.
+Claude es amnésico entre sesiones y ciego entre clientes: lo que leíste en Claude Code no existe para Claude Desktop, y cada sesión nueva re-lee los mismos archivos como si fuera la primera vez. Este MCP es el mismo proceso local compartido por todos tus clientes, con estado persistente en disco — es la memoria que Claude no tiene. El ahorro de tokens que produce es real, pero es una consecuencia, no la promesa: lo que diferencia al proyecto es la **continuidad**.
 
 ## Qué es — y qué NO es
 
 **Es:**
 
-- Una herramienta para que archivos de 20.000 tokens no entren enteros al contexto de Claude cuando solo necesitás 400.
-- Un motor de procesamiento por lotes: clasificar 50 emails, extraer campos de 30 facturas, resumir 20 documentos — sin que Claude vea los originales.
-- Determinista donde importa: `smart_read` devuelve fragmentos *exactos* del archivo (ranking local BM25/embeddings), nunca resúmenes con pérdida generados por un modelo débil.
+- Continuidad: lo leído/decidido en una sesión sigue disponible en la próxima, y en cualquier otro cliente.
+- Una capa para que archivos de 20.000 tokens no entren enteros al contexto de Claude cuando solo necesitás 400.
+- Determinista donde importa: `smart_read` devuelve fragmentos *exactos* del archivo (ranking local BM25/embeddings) y diffs *exactos*, nunca resúmenes con pérdida generados por un modelo débil.
 
 **NO es:**
 
 - Un "ahorrador mágico de tokens" para tu chat diario. Si tu sesión es conversación normal, esto no te ayuda — y ninguna herramienta lo hará.
-- Un compresor de código. Comprimir código con LLMs baratos degrada las respuestas de Claude y termina costando más tokens en reintentos. Por eso v2 eliminó esa función.
+- Un compresor de código. Comprimir código con LLMs baratos degrada las respuestas de Claude y termina costando más en reintentos. Nunca se hizo acá.
 
-## Las 5 herramientas
+> **Nota:** el procesamiento masivo en modelos gratuitos (antes `router_bulk_process`) se separó a su propio repo, [`individra-bulk-offload`](https://github.com/gabicacabelos/individra-bulk-offload), porque es otro producto: dependía de servicios externos que diluían este núcleo 100% local.
+
+## Las 4 herramientas
 
 ### `router_smart_read` — Lectura quirúrgica con memoria (local, $0, sin APIs)
 
@@ -90,26 +92,9 @@ inbox(action="history")  → result + result_assets
 
 Y al revés: Claude Design puede dejarle a `code` una orden con el export final para que lo implemente. El inbox es bidireccional entre todos los clientes.
 
-### `router_bulk_process` — Offload masivo con failover transparente
+### `router_status` — Métricas honestas de la sesión
 
-```
-bulk_process(
-  items=["factura1.txt", "factura2.txt", ...],
-  instruction="extraé remitente, fecha y monto total",
-  output_schema='{"sender":str,"date":str,"amount":float}',
-  mode="map_reduce"
-)
-→ JSON consolidado; Claude nunca ve los originales
-```
-
-- Procesa en paralelo contra Groq → OpenRouter free (rotación automática de modelos).
-- Si un proveedor cae, rota al siguiente; si todos fallan para un item, se reporta el item como fallido sin romper el lote. Nunca lanza excepciones.
-- Caché SHA-256: mismo item + misma instrucción = respuesta instantánea sin API.
-- **Cuándo usarlo:** clasificación, extracción estructurada, resúmenes por lote. **Cuándo no:** código crítico, razonamiento complejo — eso es trabajo de Claude.
-
-### `router_status` — Métricas honestas + diagnóstico
-
-La métrica principal es `tokens_kept_out_of_context`: tokens de las fuentes originales que **no** entraron a la ventana de Claude. Con `deep=true` testea conectividad real de cada proveedor (los free tiers mueren sin avisar — esto te dice exactamente cuál y por qué).
+La métrica principal es `tokens_kept_out_of_context`: tokens de las fuentes originales que **no** entraron a la ventana de Claude. También reporta lecturas, hits de memoria (unchanged/diff), estado del ledger y órdenes pendientes en el inbox. Con `deep=true` suma diagnóstico local (fastembed/python).
 
 ## Ahorro real (números honestos)
 
@@ -120,7 +105,6 @@ La métrica principal es `tokens_kept_out_of_context`: tokens de las fuentes ori
 | Retomar una tarea en sesión/cliente nuevo (resume) | ~300 tokens vs re-explorar todo | 100% |
 | Buscar algo puntual en un archivo de 20k tokens | 80-95% | 100% (fragmentos exactos) |
 | Ingesta de HTML/web sucio | 40-60% | 100% (solo se quita ruido) |
-| Lote de 30 extracciones (~150k tokens de fuentes) | ~95%+ | la del modelo gratis (suficiente para extracción simple) |
 | Chat conversacional normal | ~0% | — |
 
 El overhead fijo es ~500 tokens de definiciones de tools por sesión. Si no procesás archivos grandes ni lotes, ese es tu costo neto: sé honesto con vos mismo sobre tu caso de uso.
@@ -130,22 +114,10 @@ El overhead fijo es ~500 tokens de definiciones de tools por sesión. Si no proc
 ```bash
 git clone <repo> && cd individra-mcp-router
 pip install -r requirements.txt
-# Opcional (ranking semántico local): pip install fastembed
+# Opcional (ranking semántico local para smart_read): pip install fastembed
 ```
 
-Claves gratuitas (opcionales — solo necesarias para `bulk_process`):
-
-- Groq: https://console.groq.com (free tier)
-- OpenRouter: https://openrouter.ai (modelos `:free`)
-
-Crear `.env` junto a `server.py`:
-
-```
-GROQ_API_KEY=gsk_...
-OPENROUTER_API_KEY=sk-or-v1-...
-```
-
-`smart_read` funciona sin ninguna clave: es 100% local.
+No necesita ninguna API key ni archivo `.env`: las cuatro herramientas son 100% locales.
 
 ### Registrarlo en todas tus sesiones de Claude
 
@@ -174,7 +146,7 @@ El servidor declara `instructions` que se inyectan en el system prompt de cada s
 
 ```
 Para leer archivos >15KB o buscar algo puntual en ellos usá router_smart_read con query.
-Para tareas repetitivas sobre muchos archivos/textos usá router_bulk_process.
+Al cerrar tareas largas guardá un router_checkpoint; al retomar, resumílo.
 ```
 
 ## Arquitectura
@@ -188,20 +160,15 @@ smart_read ──▶ sanitizer (HTML/texto, local) ──▶ ledger (¿ya lo vi?
                           └─ BM25 puro-Python (fallback, 0 deps)
 checkpoint ──▶ checkpoints/*.json (legible/editable) + verificación de hashes al resumir
 inbox ──────▶ cola SQLite compartida (órdenes entre Cowork/Code/Desktop/Design + assets de handoff + resultados)
-bulk_process ─▶ caché SHA-256 (SQLite) ──▶ CheapLLM
-                                            ├─ Groq llama-3.1-8b (LPU, rápido)
-                                            ├─ OpenRouter :free (rotación de modelos)
-                                            └─ circuit breaker (no insiste con caídos)
 ```
 
-Los modelos `:free` de OpenRouter rotan constantemente, así que el servidor **descubre el catálogo vivo en runtime**: consulta `openrouter.ai/api/v1/models`, filtra los de precio $0, los rankea por familia (qwen3 → llama → nemotron → ...) y cachea la lista 6 horas. Si la API no responde, cae a una lista estática de fallback. Nunca más un slug muerto hardcodeado. `status(deep=true)` muestra cuántos modelos descubrió y testea los primeros 3.
+Todo local: el ledger y el inbox son SQLite en disco; los checkpoints son JSON legibles/editables. Sin red, sin API keys, sin dependencias externas para el núcleo.
 
 ## Limitaciones conocidas
 
 - BM25 es léxico: una query sin palabras en común con el texto degrada a los primeros chunks del archivo. Instalar `fastembed` mejora las queries semánticas (requiere onnxruntime compatible con tu versión de Python).
-- `bulk_process` hereda la calidad de los modelos gratuitos: excelente para extracción/clasificación simple, insuficiente para análisis profundo.
-- Los resultados de `bulk_process` los generó un modelo externo: revisalos antes de usarlos en contexto crítico.
+- No hay memoria semántica de "decisiones de proyecto" todavía (ej: "nunca usar Redux"): el checkpoint captura estado de tarea, no reglas permanentes. Es una extensión natural pendiente.
 
 ## Licencia
 
-MIT — ver `LICENSE`. El código v1 (router universal con compresión LLM) está preservado en `legacy/`.
+MIT — ver `LICENSE`.
