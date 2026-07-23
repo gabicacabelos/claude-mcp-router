@@ -58,11 +58,13 @@ async def get_free_models() -> list[str]:
             r = await client.get(OPENROUTER_MODELS_URL, timeout=15.0)
         r.raise_for_status()
         data = r.json().get("data", [])
+        _EXCLUDE = ("safety", "guard", "moderation", "classifier", "embed", "rerank")
         free = [
             m["id"] for m in data
             if m.get("pricing", {}).get("prompt") == "0"
             and m.get("pricing", {}).get("completion") == "0"
             and m.get("id")
+            and not any(x in m["id"].lower() for x in _EXCLUDE)
         ]
 
         def rank(mid: str) -> int:
