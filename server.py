@@ -63,6 +63,35 @@ logger = logging.getLogger("individra-mcp")
 
 ledger = FileLedger(db_path=str(_server_dir / "cache" / "ledger.db"))
 inbox = Inbox(db_path=str(_server_dir / "cache" / "inbox.db"))
+
+def _code_staleness(boot_time: float) -> dict | None:
+    """
+    Un proceso MCP no recarga módulos solo: si server.py o router/*.py cambian
+    en disco después de que este proceso arrancó (por un git pull/checkout, o
+    porque otro cliente editó el código), este proceso sigue corriendo la
+    versión vieja hasta que lo reinicien. git push no reinicia nada — esto
+    hace observable esa desincronización sin tener que inferirla a mano
+    (revisar qué tools desaparecieron, probar comportamiento nuevo a ciegas, etc).
+    """
+    try:
+        watched = [_server_dir / "server.py", *sorted((_server_dir / "router").glob("*.py"))]
+        newest_path, newest_mtime = None, 0.0
+        for p in watched:
+            if p.exists():
+                m = p.stat().st_mtime
+                if m > newest_mtime:
+                    newest_path, newest_mtime = p, m
+        if newest_mtime > boot_time:
+            return {
+                "stale": True,
+                "changed_file": newest_path.name if newest_path else None,
+                "changed_ago_s": round(time.time() - newest_mtime),
+                "hint": "el código en disco cambió después de que este proceso arrancó — reiniciá el MCP (reconectar en /mcp o reiniciar el cliente) para aplicar los cambios",
+            }
+        return {"stale": False}
+    except Exception as e:
+        logger.warning(f"chequeo de staleness falló: {e}")
+        return None
 _checkpoints_dir = _server_dir / "checkpoints"
 
 _stats = {
@@ -525,8 +554,12 @@ async def router_inbox(params: InboxInput) -> str:
 async def router_status(params: StatusInput) -> str:
     """
     Métricas de la sesión: tokens que NO entraron al contexto de Claude, lecturas,
-    hits de memoria (unchanged/diff), estado del ledger e inbox. Con deep=true suma
-    diagnóstico local (fastembed/python).
+    hits de memoria (unchanged/diff), estado del ledger e inbox. Incluye
+    `code_staleness`: si server.py o router/*.py cambiaron en disco después de
+    que ESTE proceso arrancó (git push no reinicia nada — un proceso MCP no
+    recarga módulos solo), lo marca `stale=true` con el archivo y hace cuánto
+    cambió. Si aparece stale=true, reiniciá el MCP antes de confiar en el
+    comportamiento nuevo. Con deep=true suma diagnóstico local (fastembed/python).
     """
     saved = max(0, _stats["tokens_file_total"] - _stats["tokens_delivered"])
     status = {
@@ -542,6 +575,7 @@ async def router_status(params: StatusInput) -> str:
         },
         "ledger": ledger.stats(),
         "inbox_pending": len(inbox.check()),
+        "code_staleness": _code_staleness(_stats["start_time"]),
     }
 
     if params.deep:

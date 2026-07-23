@@ -181,10 +181,17 @@ inbox ──────▶ cola SQLite compartida (órdenes entre Cowork/Code/D
 
 Todo local: el ledger y el inbox son SQLite en disco; los checkpoints son JSON legibles/editables. Sin red, sin API keys, sin dependencias externas para el núcleo.
 
+## Un proceso MCP no se auto-actualiza
+
+Cada cliente lanza `server.py` como un proceso propio y lo mantiene vivo mientras dura la sesión. Editar el código en disco — o hacer `git pull`/`git push` — **no** afecta a un proceso que ya está corriendo: Python no recarga módulos solo. Si cambiaste algo y el comportamiento nuevo no aparece, no es un bug: reiniciá el MCP (reconectar en `/mcp` o reiniciar el cliente).
+
+Para no tener que inferir eso a mano, `router_status` incluye `code_staleness`: compara la fecha de modificación de `server.py`/`router/*.py` contra el momento en que el proceso arrancó, y devuelve `{"stale": true, "changed_file": "...", "hint": "..."}` si el disco cambió después del boot. Chequealo si algo no se comporta como esperás tras editar código.
+
 ## Limitaciones conocidas
 
 - BM25 es léxico: una query sin palabras en común con el texto degrada a los primeros chunks del archivo. Instalar `fastembed` mejora las queries semánticas (requiere onnxruntime compatible con tu versión de Python).
 - No hay memoria semántica de "decisiones de proyecto" todavía (ej: "nunca usar Redux"): el checkpoint captura estado de tarea, no reglas permanentes. Es una extensión natural pendiente.
+- `code_staleness` detecta que el código cambió — no lo reinicia solo. Un auto-restart no es seguro acá: varios clientes pueden compartir el mismo proceso, y matarlo a mitad de una orden del inbox le corta la herramienta a otra sesión sin garantía de que vuelva sola.
 
 ## Licencia
 

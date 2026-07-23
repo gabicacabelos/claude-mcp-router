@@ -484,3 +484,43 @@ def test_inbox_find_pending_duplicate_returns_none_when_no_match(inbox):
     inbox.send("algo", to_client="code")
     assert inbox.find_pending_duplicate("code", "otra cosa") is None
     assert inbox.find_pending_duplicate("design", "algo") is None  # destino distinto, no matchea
+
+
+# ─── server: detección de código desactualizado en el proceso vivo ────────────
+# Un proceso MCP no recarga módulos solo: si server.py/router/*.py cambian en
+# disco después del arranque, sigue corriendo la versión vieja hasta reiniciar.
+# _code_staleness() compara mtimes contra el boot_time del proceso para hacer
+# esa desincronización observable vía router_status en lugar de tener que
+# inferirla a mano.
+
+@pytest.fixture(scope="module")
+def server_module():
+    """Importa server.py como módulo (requiere el paquete `mcp` instalado)."""
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "individra_server", Path(__file__).parent.parent / "server.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_code_staleness_false_right_after_boot(server_module):
+    result = server_module._code_staleness(server_module._stats["start_time"])
+    assert result == {"stale": False}
+
+
+def test_code_staleness_true_when_boot_predates_files(server_module):
+    # boot_time muy en el pasado → cualquier archivo watched "cambió después"
+    result = server_module._code_staleness(0.0)
+    assert result["stale"] is True
+    assert result["changed_file"] in ("server.py", "inbox.py", "ledger.py", "ranker.py", "sanitizer.py", "__init__.py")
+    assert isinstance(result["changed_ago_s"], int)
+    assert "reiniciá el MCP" in result["hint"]
+
+
+def test_code_staleness_false_when_boot_is_in_the_future(server_module):
+    # boot_time posterior a cualquier mtime real → nada "cambió después"
+    result = server_module._code_staleness(time.time() + 3600)
+    assert result == {"stale": False}
