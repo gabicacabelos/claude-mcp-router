@@ -25,9 +25,9 @@ claude_desktop_config.json (o `claude mcp add --scope user`):
 ─────────────────────────────────────────────
 {
   "mcpServers": {
-    "individra-router": {
+    "claude-continuity": {
       "command": "python",
-      "args": ["C:/ruta/a/individra-mcp-router/server.py"]
+      "args": ["C:/ruta/a/claude-continuity-mcp/server.py"]
     }
   }
 }
@@ -203,7 +203,7 @@ INSTRUCTIONS = """Memoria y continuidad para Claude entre sesiones y clientes �
 4. router_status: métricas de la sesión (tokens que no entraron al contexto, lecturas, checkpoints, inbox).
 Todas las salidas vienen en JSON minificado."""
 
-mcp = FastMCP("individra_router_mcp", instructions=INSTRUCTIONS)
+mcp = FastMCP("claude_continuity_mcp", instructions=INSTRUCTIONS)
 
 
 # ─────────────────────────────────────────────

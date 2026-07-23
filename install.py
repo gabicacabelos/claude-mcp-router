@@ -102,34 +102,19 @@ def configure_claude_desktop() -> bool:
     if "mcpServers" not in config:
         config["mcpServers"] = {}
 
-    # Leer claves del .env
-    env_file = PROJECT_DIR / ".env"
-    env_vars = {}
-    if env_file.exists():
-        with open(env_file) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, value = line.partition("=")
-                    env_vars[key.strip()] = value.strip()
-
     # En Windows usar forward slashes para el path
     server_path = str(SERVER_SCRIPT).replace("\\", "/")
 
-    config["mcpServers"]["individra-router"] = {
+    # 100% local desde v3.0.0 — sin API keys, sin .env
+    config["mcpServers"]["claude-continuity"] = {
         "command": sys.executable,
         "args": [server_path],
-        "env": {
-            "GEMINI_API_KEY": env_vars.get("GEMINI_API_KEY", ""),
-            "GROQ_API_KEY": env_vars.get("GROQ_API_KEY", ""),
-            "OPENROUTER_API_KEY": env_vars.get("OPENROUTER_API_KEY", ""),
-        }
     }
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
-    ok('Servidor "individra-router" agregado a Claude Desktop')
+    ok('Servidor "claude-continuity" agregado a Claude Desktop')
     return True
 
 
