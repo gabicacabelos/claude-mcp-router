@@ -26,7 +26,7 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_FREE_MODELS = [
     "qwen/qwen-2.5-7b-instruct:free",          # Qwen — alta disponibilidad
     "meta-llama/llama-3.2-3b-instruct:free",   # Llama 3.2 — fallback sólido
-    "deepseek/deepseek-r1-distill-llama-70b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",  # reemplaza a deepseek-r1-distill-70b (discontinuado, jul 2026)
     "baidu/cobuddy:free",                      # Baidu — puede devolver content=None
 ]
 

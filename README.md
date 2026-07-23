@@ -1,173 +1,166 @@
-# INDIVIDRA MCP Router
+# INDIVIDRA MCP — Context Ingestion & Bulk Offload Engine
 
-> Reduce el consumo de tokens de Claude en 40-70% comprimiendo contexto con modelos gratuitos (Groq + OpenRouter) antes de enviarlo a Claude.
+MCP server que protege la ventana de contexto de Claude con tres estrategias que **sí funcionan**: lectura quirúrgica de archivos grandes (Mini-RAG 100% local, sin pérdida de fidelidad), **memoria de ingesta cross-sesión** (lo que ningún cliente de Claude hace: recordar qué archivos ya leíste y devolver solo los diffs), y offload de trabajo masivo/repetitivo a modelos gratuitos externos.
 
-Funciona como un servidor [MCP](https://modelcontextprotocol.io) que se integra directamente con **Claude Desktop**. Sin proxies, sin intermediarios — todo corre en tu máquina.
+## Por qué existe
 
----
+Claude es amnésico entre sesiones y ciego entre clientes: lo que leíste en Claude Code no existe para Claude Desktop, y cada sesión nueva re-lee los mismos archivos quemando miles de tokens. Este MCP es el mismo proceso local compartido por todos tus clientes, con estado persistente en disco — puede ser la memoria que Claude no tiene.
 
-## ¿Qué problema resuelve?
+## Qué es — y qué NO es
 
-Claude tiene un contexto limitado y cada token cuesta. Cuando trabajás con documentos largos, wikis, especificaciones o logs, la mayoría del contenido es redundante. Este router comprime ese contenido automáticamente usando modelos gratuitos (Groq Llama, OpenRouter) antes de pasárselo a Claude.
+**Es:**
 
-**Resultado típico:** un documento de 5000 tokens se convierte en ~2500 tokens con la misma información técnica relevante.
+- Una herramienta para que archivos de 20.000 tokens no entren enteros al contexto de Claude cuando solo necesitás 400.
+- Un motor de procesamiento por lotes: clasificar 50 emails, extraer campos de 30 facturas, resumir 20 documentos — sin que Claude vea los originales.
+- Determinista donde importa: `smart_read` devuelve fragmentos *exactos* del archivo (ranking local BM25/embeddings), nunca resúmenes con pérdida generados por un modelo débil.
 
----
+**NO es:**
 
-## Arquitectura
+- Un "ahorrador mágico de tokens" para tu chat diario. Si tu sesión es conversación normal, esto no te ayuda — y ninguna herramienta lo hará.
+- Un compresor de código. Comprimir código con LLMs baratos degrada las respuestas de Claude y termina costando más tokens en reintentos. Por eso v2 eliminó esa función.
+
+## Las 4 herramientas
+
+### `router_smart_read` — Lectura quirúrgica con memoria (local, $0, sin APIs)
 
 ```
-Claude Desktop
-    │
-    ▼
-MCP Router (local, Python)
-    │
-    ├─▶ Groq llama-3.1-8b-instant   ← primario (textos ≤ 3500 tokens, LPU ultrarrápido)
-    ├─▶ OpenRouter free models       ← fallback (textos grandes o cuando Groq rate-limit)
-    │     ├─ qwen/qwen-2.5-7b-instruct:free
-    │     ├─ meta-llama/llama-3.2-3b-instruct:free
-    │     └─ deepseek/deepseek-r1-distill-llama-70b:free
-    └─▶ Pass-through                 ← último recurso (texto original sin modificar)
+smart_read(file_path="docs/manual.md", query="¿dónde se configuran los webhooks?")
+→ los 2-4 fragmentos exactos relevantes, con números de línea
 ```
 
-**Componentes internos:**
-- **Tier detection** — código, JSON, YAML y stack traces nunca se comprimen (integridad crítica)
-- **Caché SHA-256** — el mismo documento no se comprime dos veces (SQLite local, TTL 24h)
-- **Circuit breaker** — si un proveedor falla 5 veces, se bypasea 5 minutos automáticamente
-- **Intent classifier** — usa Groq para detectar si una tarea es de código antes de delegarla
+- Archivo chico (≤ ~6KB): lo devuelve entero, limpio.
+- Archivo grande + `query`: chunking + ranking híbrido (fastembed si está instalado, BM25 puro-Python si no) → solo los fragmentos relevantes. Ahorro típico: 70-90% del archivo, **cero pérdida de fidelidad**.
+- Archivo grande sin `query`: mapa estructural (outline con líneas) para decidir qué pedir.
+- HTML: se limpia localmente (scripts, tags, boilerplate fuera) antes de procesar.
 
----
+**Memoria cross-sesión (diff reads):** cada lectura queda registrada (hash + snapshot en SQLite local). En cualquier sesión futura, en cualquier cliente:
 
-## Requisitos
+- Archivo sin cambios → `{"status":"unchanged","outline":[...]}` — ~50-100 tokens en vez de miles. En tests: 90 tokens vs 10.195 del archivo.
+- Archivo modificado → **solo el diff unificado** contra el snapshot (99%+ de ahorro medido).
+- `force_full=true` saltea la memoria cuando necesitás el contenido completo.
 
-- Python 3.10+
-- [Claude Desktop](https://claude.ai/download)
-- API keys gratuitas (ver abajo)
+### `router_checkpoint` — Handoff de contexto entre sesiones y clientes
 
----
+```
+checkpoint(action="save", name="refactor-auth",
+           summary="Migrado el login a JWT, falta el refresh token",
+           decisions=["usar RS256"], open_items=["tests de expiración"],
+           files=["src/auth.py"])
+```
+
+Al cerrar una tarea larga (o cuando el contexto se llena), Claude guarda el estado como JSON legible en `checkpoints/` — editable por vos, compartible con tu equipo. Una sesión nueva —en Desktop, Code o Cowork, da igual— hace `action="resume"` y recupera todo en ~300 tokens, **incluyendo qué archivos cambiaron en disco desde el checkpoint** (comparación por hash, sin re-leerlos). `action="list"` muestra los checkpoints disponibles.
+
+### `router_bulk_process` — Offload masivo con failover transparente
+
+```
+bulk_process(
+  items=["factura1.txt", "factura2.txt", ...],
+  instruction="extraé remitente, fecha y monto total",
+  output_schema='{"sender":str,"date":str,"amount":float}',
+  mode="map_reduce"
+)
+→ JSON consolidado; Claude nunca ve los originales
+```
+
+- Procesa en paralelo contra Groq → OpenRouter free (rotación automática de modelos).
+- Si un proveedor cae, rota al siguiente; si todos fallan para un item, se reporta el item como fallido sin romper el lote. Nunca lanza excepciones.
+- Caché SHA-256: mismo item + misma instrucción = respuesta instantánea sin API.
+- **Cuándo usarlo:** clasificación, extracción estructurada, resúmenes por lote. **Cuándo no:** código crítico, razonamiento complejo — eso es trabajo de Claude.
+
+### `router_status` — Métricas honestas + diagnóstico
+
+La métrica principal es `tokens_kept_out_of_context`: tokens de las fuentes originales que **no** entraron a la ventana de Claude. Con `deep=true` testea conectividad real de cada proveedor (los free tiers mueren sin avisar — esto te dice exactamente cuál y por qué).
+
+## Ahorro real (números honestos)
+
+| Escenario | Ahorro | Fidelidad |
+|---|---|---|
+| Re-leer un archivo ya conocido, sin cambios | 98-99% | 100% (outline + memoria) |
+| Re-leer un archivo conocido que cambió | 90-99% | 100% (diff exacto) |
+| Retomar una tarea en sesión/cliente nuevo (resume) | ~300 tokens vs re-explorar todo | 100% |
+| Buscar algo puntual en un archivo de 20k tokens | 80-95% | 100% (fragmentos exactos) |
+| Ingesta de HTML/web sucio | 40-60% | 100% (solo se quita ruido) |
+| Lote de 30 extracciones (~150k tokens de fuentes) | ~95%+ | la del modelo gratis (suficiente para extracción simple) |
+| Chat conversacional normal | ~0% | — |
+
+El overhead fijo es ~500 tokens de definiciones de tools por sesión. Si no procesás archivos grandes ni lotes, ese es tu costo neto: sé honesto con vos mismo sobre tu caso de uso.
 
 ## Instalación
 
-### 1. Clonar el repo
-
 ```bash
-git clone https://github.com/tu-usuario/individra-mcp-router.git
-cd individra-mcp-router
+git clone <repo> && cd individra-mcp-router
+pip install -r requirements.txt
+# Opcional (ranking semántico local): pip install fastembed
 ```
 
-### 2. Obtener API keys gratuitas
+Claves gratuitas (opcionales — solo necesarias para `bulk_process`):
 
-| Proveedor | Link | Límite free |
-|---|---|---|
-| **Groq** | https://console.groq.com/keys | 14,400 req/día, 6k TPM |
-| **OpenRouter** | https://openrouter.ai/keys | Variable por modelo |
+- Groq: https://console.groq.com (free tier)
+- OpenRouter: https://openrouter.ai (modelos `:free`)
 
-> Gemini es opcional. Si tenés una key válida, podés agregarla en `.env` y el router la intentará como tercer proveedor.
-
-### 3. Ejecutar el instalador
-
-```bash
-python install.py
-```
-
-El instalador:
-1. Instala dependencias Python (`pip install -r requirements.txt`)
-2. Crea `.env` a partir de `.env.example`
-3. Agrega `individra-router` a `claude_desktop_config.json` automáticamente
-4. Verifica que `server.py` compile correctamente
-
-### 4. Editar `.env` con tus claves
-
-```env
-GROQ_API_KEY=tu_clave_aqui
-OPENROUTER_API_KEY=tu_clave_aqui
-```
-
-### 5. Reiniciar Claude Desktop
-
-Cerrar completamente (desde la bandeja del sistema) y volver a abrir.
-
-### 6. Verificar
-
-Escribí en Claude:
+Crear `.env` junto a `server.py`:
 
 ```
-router_diagnose()
+GROQ_API_KEY=gsk_...
+OPENROUTER_API_KEY=sk-or-v1-...
 ```
 
-Deberías ver `"status": "ok"` para Groq y OpenRouter.
+`smart_read` funciona sin ninguna clave: es 100% local.
 
----
+### Registrarlo en todas tus sesiones de Claude
 
-## Herramientas disponibles en Claude
-
-| Herramienta | Descripción |
-|---|---|
-| `router_compress_context` | Comprime texto largo antes de pasarlo a Claude |
-| `router_route_task` | Delega una tarea completa a un modelo gratuito |
-| `router_smart_read` | Lee un archivo con compresión automática según tipo y tamaño |
-| `router_status` | Estado del sistema: circuit breakers, tokens ahorrados, caché |
-| `router_diagnose` | Testea conectividad con cada proveedor y devuelve el error exacto |
-
----
-
-## Lógica de tiers
-
-| Tier | Tipo de contenido | Acción |
-|---|---|---|
-| 0 | Código, JSON, YAML, configs, stack traces | Sin compresión — integridad crítica |
-| 1 | Texto < 2000 tokens | Sin compresión — ya es corto |
-| 2 | Texto 2000–10000 tokens | Compresión media (~50%) |
-| 3 | Texto > 10000 tokens | Compresión fuerte (~70%) |
-
----
-
-## Troubleshooting
-
-**El router no aparece en Claude**
-→ Reiniciar Claude Desktop completamente (no solo la ventana).
-
-**Error "Module not found"**
-→ `pip install -r requirements.txt`
-
-**Groq 429**
-→ Normal en free tier si hacés muchas compresiones seguidas. El router hace retry automático y cae al fallback de OpenRouter. Se recupera solo en ~60 segundos.
-
-**`router_diagnose()` muestra error en Gemini**
-→ Algunos planes/regiones de Google AI Studio tienen cuota 0 en los modelos gratuitos. El router funciona perfectamente sin Gemini usando Groq + OpenRouter.
-
----
-
-## Configuración manual (sin instalador)
-
-Si preferís configurar manualmente, agregá esto a tu `claude_desktop_config.json`:
+**Claude Desktop / Cowork** — `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "individra-router": {
       "command": "python",
-      "args": ["/ruta/absoluta/a/individra-mcp-router/server.py"],
-      "env": {
-        "GROQ_API_KEY": "tu_clave",
-        "OPENROUTER_API_KEY": "tu_clave"
-      }
+      "args": ["C:/ruta/a/individra-mcp-router/server.py"]
     }
   }
 }
 ```
 
-Rutas del config por sistema operativo:
-- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Linux:** `~/.config/Claude/claude_desktop_config.json`
+**Claude Code** (alcance usuario = disponible en todos los proyectos):
 
----
+```bash
+claude mcp add individra-router --scope user -- python /ruta/a/server.py
+```
 
-## Contribuciones
+### Activación automática
 
-PRs bienvenidos. Si encontrás un modelo free de OpenRouter que funcione bien para compresión técnica, abrí un issue con el nombre del modelo y resultados de prueba.
+El servidor declara `instructions` que se inyectan en el system prompt de cada sesión, indicándole a Claude cuándo usar cada tool sin que se lo pidas. Para reforzarlo, agregá una línea a tu `CLAUDE.md` global:
 
----
+```
+Para leer archivos >15KB o buscar algo puntual en ellos usá router_smart_read con query.
+Para tareas repetitivas sobre muchos archivos/textos usá router_bulk_process.
+```
 
-Construido por [INDIVIDRA](https://individratec.com) — Automatización con IA para empresas B2B.
+## Arquitectura
+
+```
+smart_read ──▶ sanitizer (HTML/texto, local) ──▶ ledger (¿ya lo vi?)
+                    │                              ├─ sin cambios → outline (~50 tok)
+                    │                              └─ cambió → diff unificado
+                    └──▶ ranker (con query)
+                          ├─ fastembed (bge-small, ONNX local) si está
+                          └─ BM25 puro-Python (fallback, 0 deps)
+checkpoint ──▶ checkpoints/*.json (legible/editable) + verificación de hashes al resumir
+bulk_process ─▶ caché SHA-256 (SQLite) ──▶ CheapLLM
+                                            ├─ Groq llama-3.1-8b (LPU, rápido)
+                                            ├─ OpenRouter :free (rotación de modelos)
+                                            └─ circuit breaker (no insiste con caídos)
+```
+
+Los modelos `:free` de OpenRouter rotan constantemente: la lista vive en `router/providers.py` (`OPENROUTER_FREE_MODELS`) — verificá el catálogo vigente en openrouter.ai/models si `status(deep=true)` reporta 404s.
+
+## Limitaciones conocidas
+
+- BM25 es léxico: una query sin palabras en común con el texto degrada a los primeros chunks del archivo. Instalar `fastembed` mejora las queries semánticas (requiere onnxruntime compatible con tu versión de Python).
+- `bulk_process` hereda la calidad de los modelos gratuitos: excelente para extracción/clasificación simple, insuficiente para análisis profundo.
+- Los resultados de `bulk_process` los generó un modelo externo: revisalos antes de usarlos en contexto crítico.
+
+## Licencia
+
+MIT — ver `LICENSE`. El código v1 (router universal con compresión LLM) está preservado en `legacy/`.

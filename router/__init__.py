@@ -1,18 +1,21 @@
 """
-INDIVIDRA MCP Router — Paquete principal
+INDIVIDRA MCP — Context Ingestion & Bulk Offload Engine
 """
-from .tiers import TierDetector, Tier
 from .cache import RouterCache
 from .circuit_breaker import CircuitBreaker, CircuitState
-from .classifier import classify_intent
-from .compressor import ContextCompressor
+from .providers import CheapLLM
+from .ranker import build_outline, chunk_text, rank_chunks
+from .sanitizer import clean_text, sanitize_file_content, strip_html
 
 __all__ = [
-    "TierDetector",
-    "Tier",
     "RouterCache",
     "CircuitBreaker",
     "CircuitState",
-    "classify_intent",
-    "ContextCompressor",
+    "CheapLLM",
+    "rank_chunks",
+    "chunk_text",
+    "build_outline",
+    "sanitize_file_content",
+    "strip_html",
+    "clean_text",
 ]

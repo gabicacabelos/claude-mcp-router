@@ -38,7 +38,9 @@ class RouterCache:
         self._db: Optional[aiosqlite.Connection] = None
 
     async def init(self) -> None:
-        """Inicializa la DB y crea tablas si no existen."""
+        """Inicializa la DB y crea tablas si no existen. Idempotente: no re-conecta."""
+        if self._db is not None:
+            return
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.db_path)
         await self._db.execute("""

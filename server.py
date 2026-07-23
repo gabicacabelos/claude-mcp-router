@@ -1,399 +1,217 @@
 #!/usr/bin/env python3
 """
-INDIVIDRA MCP Router — Servidor FastMCP principal
+INDIVIDRA MCP — Context Ingestion & Bulk Offload Engine  (v2.0.0)
 
-Herramientas expuestas a Claude:
-  router_compress_context  → Comprime texto grande antes de enviarlo a Claude
-  router_route_task        → Delega tarea completa a modelo barato
-  router_smart_read        → Lee archivo con compresión inteligente por tier
-  router_status            → Estado del sistema: circuit breakers, caché, tokens ahorrados
+3 herramientas de alto impacto:
+  router_smart_read    → Lectura quirúrgica de archivos grandes (Mini-RAG local, $0)
+  router_bulk_process  → Offload masivo de tareas repetitivas a modelos gratuitos
+  router_status        → Estado, métricas honestas y diagnóstico de proveedores
+
+Filosofía v2:
+  - El ahorro real está en NO meter archivos de 20k tokens al contexto de Claude,
+    no en resumirlos con pérdida usando modelos débiles.
+  - smart_read es determinista y local: devuelve los chunks EXACTOS del archivo.
+  - bulk_process delega trabajo repetitivo (clasificar/extraer sobre N items)
+    donde los modelos gratis sí rinden, con failover transparente.
+  - Todas las salidas van minificadas: ni un token regalado.
 
 ─────────────────────────────────────────────
-Configuración en claude_desktop_config.json:
+claude_desktop_config.json (o `claude mcp add --scope user`):
 ─────────────────────────────────────────────
 {
   "mcpServers": {
     "individra-router": {
       "command": "python",
-      "args": ["C:/Users/TU_USUARIO/Escritorio/INDIVIDRA/individra-mcp-router/server.py"],
-      "env": {
-        "GEMINI_API_KEY": "tu_clave",
-        "GROQ_API_KEY": "tu_clave"
-      }
+      "args": ["C:/ruta/a/individra-mcp-router/server.py"],
+      "env": {"GROQ_API_KEY": "...", "OPENROUTER_API_KEY": "..."}
     }
   }
 }
-─────────────────────────────────────────────
 """
 
 import asyncio
 import json
 import logging
 import os
-import re
+import sys
 import time
 from pathlib import Path
 from typing import Literal, Optional
 
 import httpx
-
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from mcp.server.fastmcp import FastMCP
 
 from router.cache import RouterCache
 from router.circuit_breaker import CircuitBreaker
-from router.classifier import classify_intent
-from router.compressor import ContextCompressor
-from router.tiers import TierDetector, Tier
+from router.ledger import FileLedger
+from router.providers import CheapLLM, GROQ_API_URL, GROQ_MODEL, OPENROUTER_API_URL, OPENROUTER_FREE_MODELS
+from router.ranker import build_outline, chunk_text, rank_chunks
+from router.sanitizer import sanitize_file_content
 
 # ─────────────────────────────────────────────
 # Bootstrap
 # ─────────────────────────────────────────────
 
-# Buscar .env en el mismo directorio que server.py
 _server_dir = Path(__file__).parent
-load_dotenv(_server_dir / ".env", override=True)  # .env siempre tiene prioridad sobre el entorno del sistema
+load_dotenv(_server_dir / ".env", override=True)
 
 _config_path = _server_dir / "router_config.yaml"
-with open(_config_path) as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG: dict = {}
+if _config_path.exists():
+    with open(_config_path) as f:
+        CONFIG = yaml.safe_load(f) or {}
 
-log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(logging, log_level, logging.INFO),
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("individra-router")
-
-# ─────────────────────────────────────────────
-# Componentes
-# ─────────────────────────────────────────────
-
-# Siempre ruta absoluta relativa al script — evita errores de permisos con rutas relativas
-_db_path = str(_server_dir / "cache" / "router_cache.db")
+logger = logging.getLogger("individra-mcp")
 
 cache = RouterCache(
-    db_path=_db_path,
-    ttl_static=CONFIG["cache"].get("ttl_static_seconds", 86400),
-    ttl_dynamic=CONFIG["cache"].get("ttl_dynamic_seconds", 3600),
+    db_path=str(_server_dir / "cache" / "router_cache.db"),
+    ttl_static=CONFIG.get("cache", {}).get("ttl_static_seconds", 86400),
+    ttl_dynamic=CONFIG.get("cache", {}).get("ttl_dynamic_seconds", 3600),
 )
-
 circuit_breaker = CircuitBreaker(
-    failure_threshold=CONFIG["circuit_breaker"]["failure_threshold"],
-    reset_timeout_seconds=CONFIG["circuit_breaker"]["reset_timeout_seconds"],
+    failure_threshold=CONFIG.get("circuit_breaker", {}).get("failure_threshold", 4),
+    reset_timeout_seconds=CONFIG.get("circuit_breaker", {}).get("reset_timeout_seconds", 180),
 )
+llm = CheapLLM(circuit_breaker=circuit_breaker)
+ledger = FileLedger(db_path=str(_server_dir / "cache" / "ledger.db"))
+_checkpoints_dir = _server_dir / "checkpoints"
 
-compressor = ContextCompressor(circuit_breaker=circuit_breaker)
-
-tier_detector = TierDetector(
-    tier1_max_tokens=CONFIG["tiers"]["tier1_max_tokens"],
-    tier2_min_tokens=CONFIG["tiers"]["tier2_min_tokens"],
-)
-
-_session_stats = {
+_stats = {
     "start_time": time.time(),
-    "tokens_original": 0,
-    "tokens_compressed": 0,
+    "smart_reads": 0,
+    "tokens_file_total": 0,      # tokens de los archivos originales pedidos
+    "tokens_delivered": 0,       # tokens que efectivamente entraron al contexto de Claude
+    "bulk_items_processed": 0,
+    "bulk_items_failed": 0,
     "cache_hits": 0,
-    "api_calls_gemini": 0,
-    "api_calls_openrouter": 0,
-    "tasks_routed": 0,
+    "api_calls": 0,
+    "unchanged_hits": 0,
+    "diff_reads": 0,
 }
 
+VERSION = "2.1.0"
+
+# Umbral: archivos por debajo se devuelven enteros (el overhead de RAG no rinde)
+FULL_RETURN_MAX_TOKENS = 1500
+BULK_ITEM_MAX_CHARS = 12000
+BULK_MAX_CONCURRENCY = 4
+
+
+def _tokens(text: str) -> int:
+    return len(text) // 4
+
+
+def _j(obj) -> str:
+    """JSON minificado — política global: ni un token regalado."""
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+def _ledger_safe_record(key: str, content: str, tokens: int, outline: list[str] | None = None) -> None:
+    """Registra en el ledger sin romper el flujo si SQLite falla."""
+    try:
+        ledger.record(key, content, outline if outline is not None else build_outline(content), tokens)
+    except Exception as e:
+        logger.warning(f"ledger.record falló: {e}")
+
+
 # ─────────────────────────────────────────────
-# FastMCP
+# FastMCP + instructions (auto-activación)
 # ─────────────────────────────────────────────
 
-mcp = FastMCP("individra_router_mcp")
+INSTRUCTIONS = """Suite de ingesta de contexto y procesamiento masivo con memoria cross-sesión. Usala PROACTIVAMENTE para proteger tu ventana de contexto:
+1. router_smart_read: para leer un archivo grande (>15KB) o buscar algo puntual en cualquier archivo, pasá `query` con lo que buscás — devuelve solo los fragmentos exactos relevantes con números de línea (ranking local, sin pérdida). Sin `query` devuelve el mapa estructural. MEMORIA: si el archivo ya fue leído en una sesión anterior y no cambió, devuelve solo el outline (~50 tokens); si cambió, devuelve SOLO el diff. Usá `force_full=true` si necesitás el contenido completo igual.
+2. router_bulk_process: para tareas repetitivas sobre muchos archivos o textos (clasificar, extraer campos, resumir N items) — procesa en paralelo con modelos gratuitos externos y devuelve un JSON consolidado. No usar para código crítico ni razonamiento complejo.
+3. router_checkpoint: al cerrar una tarea larga o cuando el contexto se está llenando, guardá un checkpoint (action=save) con resumen, decisiones y pendientes. Al arrancar una sesión sobre trabajo previo, action=resume lo restaura en ~300 tokens e indica qué archivos cambiaron desde entonces.
+4. router_status: métricas de ahorro y diagnóstico de proveedores.
+Todas las salidas vienen en JSON minificado."""
+
+mcp = FastMCP("individra_router_mcp", instructions=INSTRUCTIONS)
 
 
 # ─────────────────────────────────────────────
-# Modelos Pydantic
+# Modelos de entrada
 # ─────────────────────────────────────────────
-
-class CompressInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    text: str = Field(..., description="Texto a comprimir (mínimo 50 chars)", min_length=50)
-    level: Literal["light", "medium", "heavy"] = Field(
-        default="medium",
-        description="light=60-70% del original | medium=40-60% | heavy=25-40%",
-    )
-    context_type: Literal["static", "dynamic"] = Field(
-        default="static",
-        description="static=TTL 24h (docs del proyecto) | dynamic=TTL 1h (contenido cambiante)",
-    )
-    use_cache: bool = Field(default=True, description="False para forzar nueva compresión")
-
-
-class RouteTaskInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    task: str = Field(..., description="Tarea a delegar al modelo barato", min_length=10)
-    context: Optional[str] = Field(default=None, description="Contexto adicional (se comprime si es grande)")
-
 
 class SmartReadInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    file_path: str = Field(..., description="Ruta absoluta al archivo a leer", min_length=1)
-    force_compress: bool = Field(default=False, description="Forzar compresión independientemente del tier")
-
-
-class ReadManyInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    paths: list[str] = Field(..., description="Rutas absolutas a los archivos a leer", min_length=1)
-    level: Literal["light", "medium", "heavy"] = Field(default="medium")
-    use_cache: bool = Field(default=True)
-
-
-class ExtractActionsInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    text: str = Field(..., description="Texto a analizar (notas, emails, transcripciones)", min_length=50)
-    output_format: Literal["json", "markdown"] = Field(
-        default="markdown",
-        description="markdown para lectura humana | json para procesamiento automático",
+    file_path: str = Field(..., description="Ruta absoluta al archivo", min_length=1)
+    query: Optional[str] = Field(
+        default=None,
+        description="Qué buscás en el archivo (ej: '¿dónde se configuran los webhooks?'). Si se omite y el archivo es grande, se devuelve el mapa estructural.",
+    )
+    top_k: int = Field(default=4, ge=1, le=10, description="Cantidad de fragmentos a devolver")
+    force_full: bool = Field(
+        default=False,
+        description="True = ignorar la memoria de lecturas previas y devolver contenido completo/mapa",
     )
 
 
+class BulkProcessInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Lista de rutas de archivo o textos crudos a procesar",
+    )
+    instruction: str = Field(
+        ...,
+        min_length=10,
+        description="Qué hacer con cada item (ej: 'extraé remitente, fecha y monto de esta factura')",
+    )
+    output_schema: Optional[str] = Field(
+        default=None,
+        description="Esquema JSON deseado por item (ej: '{\"sender\":str,\"amount\":float}')",
+    )
+    mode: Literal["map", "map_reduce"] = Field(
+        default="map",
+        description="map=resultado por item | map_reduce=además consolida todo en un resumen final",
+    )
+
+
+class CheckpointInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    action: Literal["save", "resume", "list"] = Field(
+        ...,
+        description="save=guardar estado de la sesión | resume=restaurar el último (o `name`) | list=ver checkpoints disponibles",
+    )
+    name: Optional[str] = Field(
+        default=None,
+        description="Nombre del checkpoint (default: 'latest'). Usá nombres por proyecto/tarea, ej: 'refactor-auth'",
+    )
+    summary: Optional[str] = Field(default=None, description="[save] Resumen del estado de la tarea (2-5 oraciones)")
+    decisions: Optional[list[str]] = Field(default=None, description="[save] Decisiones tomadas")
+    open_items: Optional[list[str]] = Field(default=None, description="[save] Pendientes / próximos pasos")
+    files: Optional[list[str]] = Field(
+        default=None,
+        description="[save] Rutas de archivos relevantes a la tarea — al hacer resume se reporta cuáles cambiaron",
+    )
+
+
+class StatusInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    deep: bool = Field(default=False, description="True = testear conectividad real con los proveedores")
+
+
 # ─────────────────────────────────────────────
-# Herramientas
+# Tool 1: smart_read — Ingesta quirúrgica (local, $0, sin pérdida)
 # ─────────────────────────────────────────────
-
-@mcp.tool(
-    name="router_compress_context",
-    annotations={
-        "title": "Comprimir Contexto con Gemini",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def router_compress_context(params: CompressInput) -> str:
-    """
-    Comprime un texto grande usando Gemini Flash Lite antes de pasarlo a Claude.
-
-    Flujo:
-      1. Detecta tier (Tier 0 = no comprimir, código/stack traces)
-      2. Verifica caché SHA-256 — retorna al instante si ya fue comprimido
-      3. Llama a Gemini (retry automático con backoff en caso de 429)
-      4. Fallback a OpenRouter si Gemini falla
-      5. Guarda en caché para futuras llamadas
-
-    Usar para: documentos de proyecto, READMEs, wikis, especificaciones largas.
-    NO usar para: código fuente, stack traces, JSON payloads.
-    """
-    await cache.init()
-
-    tier = tier_detector.detect(params.text)
-    token_count = tier_detector.estimate_tokens(params.text)
-
-    if tier == Tier.ZERO:
-        return json.dumps({
-            "status": "skipped",
-            "reason": "Tier 0 — contenido de integridad crítica (código/configuración)",
-            "text": params.text,
-            "tokens_original": token_count,
-            "tokens_result": token_count,
-            "savings_pct": 0,
-        }, ensure_ascii=False)
-
-    if token_count < 200:
-        return json.dumps({
-            "status": "skipped",
-            "reason": f"Texto corto ({token_count} tokens) — compresión no rentable",
-            "text": params.text,
-            "tokens_original": token_count,
-            "tokens_result": token_count,
-            "savings_pct": 0,
-        }, ensure_ascii=False)
-
-    cache_key = RouterCache.hash(params.text)
-
-    if params.use_cache:
-        cached = await cache.get(cache_key)
-        if cached:
-            cached_tokens = tier_detector.estimate_tokens(cached)
-            savings_pct = round((1 - cached_tokens / token_count) * 100, 1)
-            _session_stats["cache_hits"] += 1
-            _session_stats["tokens_original"] += token_count
-            _session_stats["tokens_compressed"] += cached_tokens
-            return json.dumps({
-                "status": "cache_hit",
-                "text": cached,
-                "tokens_original": token_count,
-                "tokens_result": cached_tokens,
-                "savings_pct": savings_pct,
-                "provider": "cache",
-            }, ensure_ascii=False)
-
-    level = params.level
-    if tier == Tier.TWO and level == "medium":
-        level = "heavy"
-
-    compressed, provider, success = await compressor.compress(params.text, level=level)
-
-    if success:
-        compressed_tokens = tier_detector.estimate_tokens(compressed)
-        savings_pct = round((1 - compressed_tokens / token_count) * 100, 1)
-
-        if params.use_cache:
-            ttl = (
-                CONFIG["cache"]["ttl_static_seconds"]
-                if params.context_type == "static"
-                else CONFIG["cache"]["ttl_dynamic_seconds"]
-            )
-            await cache.set(cache_key, compressed, ttl=ttl, provider=provider)
-
-        _session_stats["tokens_original"] += token_count
-        _session_stats["tokens_compressed"] += compressed_tokens
-        if provider == "gemini":
-            _session_stats["api_calls_gemini"] += 1
-        elif provider == "openrouter":
-            _session_stats["api_calls_openrouter"] += 1
-
-        logger.info(f"Compresión: {token_count} → {compressed_tokens} tokens ({savings_pct}% ahorro) via {provider}")
-
-        return json.dumps({
-            "status": "compressed",
-            "text": compressed,
-            "tokens_original": token_count,
-            "tokens_result": compressed_tokens,
-            "savings_pct": savings_pct,
-            "provider": provider,
-            "level": level,
-        }, ensure_ascii=False)
-
-    return json.dumps({
-        "status": "failed",
-        "reason": "Todos los proveedores fallaron — usar texto original",
-        "text": params.text,
-        "tokens_original": token_count,
-        "tokens_result": token_count,
-        "savings_pct": 0,
-    }, ensure_ascii=False)
-
-
-@mcp.tool(
-    name="router_route_task",
-    annotations={
-        "title": "Delegar Tarea a Modelo Barato",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def router_route_task(params: RouteTaskInput) -> str:
-    """
-    Delega una tarea completa a Gemini Flash Lite o modelos gratuitos de OpenRouter.
-
-    Usar para: emails template, traducciones, variaciones de texto, resúmenes cortos.
-    NO usar para: debugging de código, decisiones arquitecturales, análisis técnico profundo.
-    """
-    await cache.init()
-
-    groq_key = os.getenv("GROQ_API_KEY", "")
-    if groq_key:
-        intent, confidence = await classify_intent(params.task)
-        if intent == "code_task" and confidence > 0.7:
-            return json.dumps({
-                "status": "rejected",
-                "reason": f"Tarea de código detectada (confianza {confidence:.0%}) — usar Claude directamente",
-                "task": params.task,
-            }, ensure_ascii=False)
-
-    full_prompt = params.task
-    if params.context:
-        ctx_tokens = tier_detector.estimate_tokens(params.context)
-        if ctx_tokens > 1000:
-            compressed_ctx, _, success = await compressor.compress(params.context, level="medium")
-            context_to_use = compressed_ctx if success else params.context
-        else:
-            context_to_use = params.context
-        full_prompt = f"Contexto:\n{context_to_use}\n\nTarea:\n{params.task}"
-
-    groq_key = os.getenv("GROQ_API_KEY", "")
-    result_text = None
-    provider_used = "none"
-
-    if groq_key and circuit_breaker.can_call("groq"):
-        try:
-            async with __import__("httpx").AsyncClient() as client:
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {groq_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "llama-3.1-8b-instant",
-                        "messages": [{"role": "user", "content": full_prompt}],
-                        "max_tokens": 4096,
-                        "temperature": 0.7,
-                    },
-                    timeout=30.0,
-                )
-                response.raise_for_status()
-            data = response.json()
-            result_text = data["choices"][0]["message"].get("content")
-            if result_text:
-                provider_used = "groq/llama-3.1-8b-instant"
-                circuit_breaker.record_success("groq")
-                _session_stats["api_calls_gemini"] += 1  # reusa el contador existente
-            else:
-                circuit_breaker.record_failure("groq")
-        except Exception as e:
-            logger.warning(f"Groq route_task falló: {e}")
-            circuit_breaker.record_failure("groq")
-
-    if result_text is None:
-        openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
-        if openrouter_key:
-            for model in ["baidu/cobuddy:free", "qwen/qwen-2.5-7b-instruct:free", "meta-llama/llama-3.2-3b-instruct:free"]:
-                try:
-                    async with __import__("httpx").AsyncClient() as client:
-                        response = await client.post(
-                            "https://openrouter.ai/api/v1/chat/completions",
-                            headers={"Authorization": f"Bearer {openrouter_key}", "HTTP-Referer": "https://individratec.com"},
-                            json={"model": model, "messages": [{"role": "user", "content": full_prompt}], "max_tokens": 4096},
-                            timeout=45.0,
-                        )
-                        response.raise_for_status()
-                    data = response.json()
-                    result_text = data["choices"][0]["message"]["content"]
-                    provider_used = model
-                    _session_stats["api_calls_openrouter"] += 1
-                    break
-                except Exception as e:
-                    logger.warning(f"OpenRouter {model} falló: {e}")
-                    continue
-
-    if result_text is None:
-        return json.dumps({
-            "status": "failed",
-            "reason": "Todos los proveedores fallaron. Ejecutar tarea con Claude directamente.",
-        }, ensure_ascii=False)
-
-    _session_stats["tasks_routed"] += 1
-
-    return json.dumps({
-        "status": "success",
-        "result": result_text,
-        "provider": provider_used,
-        "note": "Generado por modelo externo — revisar antes de usar en contexto crítico",
-    }, ensure_ascii=False)
-
 
 @mcp.tool(
     name="router_smart_read",
     annotations={
-        "title": "Leer Archivo con Compresión Inteligente",
+        "title": "Lectura Quirúrgica de Archivos (Mini-RAG local)",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -402,530 +220,421 @@ async def router_route_task(params: RouteTaskInput) -> str:
 )
 async def router_smart_read(params: SmartReadInput) -> str:
     """
-    Lee un archivo y aplica compresión inteligente según tipo y tamaño.
+    Lee un archivo protegiendo la ventana de contexto de Claude. 100% local y determinista.
 
-    Tier 0 (código, .json, .yaml, configs) → retorna sin modificar
-    Tier 1 (docs cortos < 2000 tokens) → retorna sin modificar
-    Tier 2+ (docs > 10000 tokens) → compresión fuerte (~70%)
-
-    Caché SHA-256: el mismo archivo no se comprime dos veces si no cambió.
+    - Archivo chico (≤~6KB): lo devuelve entero, limpio y minificado.
+    - Archivo grande + query: ranking local (BM25/embeddings) → devuelve SOLO los
+      fragmentos exactos relevantes, con números de línea. Cero pérdida de fidelidad.
+    - Archivo grande sin query: devuelve el mapa estructural (outline con líneas).
+    - MEMORIA cross-sesión: si el archivo ya fue leído antes y no cambió,
+      devuelve "unchanged" + outline (~50 tokens). Si cambió, devuelve SOLO el
+      diff unificado. force_full=true para saltear la memoria.
+    - HTML: se limpia localmente (scripts/tags fuera) antes de procesar.
     """
-    await cache.init()
-
-    file_path = Path(params.file_path)
-    if not file_path.exists():
-        return json.dumps({"status": "error", "reason": f"Archivo no encontrado: {params.file_path}"})
-
+    fp = Path(params.file_path)
+    if not fp.exists() or not fp.is_file():
+        return _j({"status": "error", "reason": f"no existe: {params.file_path}"})
     try:
-        content = file_path.read_text(encoding="utf-8", errors="replace")
+        raw = fp.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
-        return json.dumps({"status": "error", "reason": f"No se pudo leer: {e}"})
+        return _j({"status": "error", "reason": str(e)[:200]})
 
-    tier = tier_detector.detect(content, file_path=str(file_path))
-    token_count = tier_detector.estimate_tokens(content)
+    content, was_html = sanitize_file_content(raw, str(fp))
+    tok_raw, tok_clean = _tokens(raw), _tokens(content)
+    _stats["smart_reads"] += 1
+    _stats["tokens_file_total"] += tok_raw
 
-    if tier == Tier.ZERO or (token_count < 500 and not params.force_compress):
-        return json.dumps({
-            "status": "raw",
-            "file": str(file_path),
-            "tier": tier.value,
-            "content": content,
-            "tokens": token_count,
-        }, ensure_ascii=False)
+    base = {"file": str(fp), "tokens_file": tok_raw}
+    if was_html:
+        base["html_stripped"] = True
+        base["tokens_after_clean"] = tok_clean
 
-    cache_key = RouterCache.hash(content)
-    cached = await cache.get(cache_key)
-    if cached:
-        cached_tokens = tier_detector.estimate_tokens(cached)
-        _session_stats["cache_hits"] += 1
-        return json.dumps({
-            "status": "cache_hit",
-            "file": str(file_path),
-            "tier": tier.value,
-            "content": cached,
-            "tokens_original": token_count,
-            "tokens_result": cached_tokens,
-            "savings_pct": round((1 - cached_tokens / token_count) * 100, 1),
-        }, ensure_ascii=False)
+    # ─── Memoria cross-sesión (ledger) — solo cuando no hay query ni force_full ───
+    key = str(fp.resolve())
+    entry = None
+    try:
+        entry = ledger.get(key)
+    except Exception as e:
+        logger.warning(f"ledger.get falló: {e}")
 
-    level = "heavy" if (tier == Tier.TWO or params.force_compress) else "medium"
-    compressed, provider, success = await compressor.compress(content, level=level)
+    if entry and not params.query and not params.force_full:
+        new_hash = FileLedger.hash(content)
+        if entry["hash"] == new_hash:
+            ledger.touch(key)
+            _stats["unchanged_hits"] += 1
+            outline = entry["outline"] or build_outline(content)
+            delivered = _tokens("\n".join(outline))
+            _stats["tokens_delivered"] += delivered
+            return _j({
+                "status": "unchanged",
+                **base,
+                "last_seen": time.strftime("%Y-%m-%d %H:%M", time.localtime(entry["last_seen"])),
+                "reads": entry["reads"] + 1,
+                "outline": outline,
+                "hint": "sin cambios desde la última lectura — usá `query` para fragmentos o `force_full=true` para el contenido completo",
+            })
+        if entry["snapshot"]:
+            diff = ledger.diff(entry["snapshot"], content)
+            outline = build_outline(content)
+            ledger.record(key, content, outline, tok_clean)
+            if diff is not None:
+                _stats["diff_reads"] += 1
+                delivered = _tokens(diff)
+                _stats["tokens_delivered"] += delivered
+                return _j({
+                    "status": "diff",
+                    **base,
+                    "since": time.strftime("%Y-%m-%d %H:%M", time.localtime(entry["last_seen"])),
+                    "tokens_delivered": delivered,
+                    "saved_vs_full_pct": round((1 - delivered / max(1, tok_clean)) * 100, 1),
+                    "diff": diff if diff else "(sin diferencias tras sanitizado)",
+                    "hint": "solo se muestran los cambios — `force_full=true` para el archivo completo",
+                })
+            # diff demasiado grande → seguir al flujo normal (ya re-registrado)
+            entry = None
 
-    if success:
-        compressed_tokens = tier_detector.estimate_tokens(compressed)
-        await cache.set(cache_key, compressed, provider=provider)
-        _session_stats["tokens_original"] += token_count
-        _session_stats["tokens_compressed"] += compressed_tokens
-        return json.dumps({
-            "status": "compressed",
-            "file": str(file_path),
-            "tier": tier.value,
-            "content": compressed,
-            "tokens_original": token_count,
-            "tokens_result": compressed_tokens,
-            "savings_pct": round((1 - compressed_tokens / token_count) * 100, 1),
-            "provider": provider,
-        }, ensure_ascii=False)
+    # Chico → entero
+    if tok_clean <= FULL_RETURN_MAX_TOKENS:
+        _stats["tokens_delivered"] += tok_clean
+        _ledger_safe_record(key, content, tok_clean)
+        return _j({"status": "full", **base, "content": content})
 
-    return json.dumps({
-        "status": "raw_fallback",
-        "file": str(file_path),
-        "tier": tier.value,
-        "content": content,
-        "tokens": token_count,
-        "note": "Compresión falló — se retorna contenido original",
-    }, ensure_ascii=False)
+    # Grande + query → chunks exactos rankeados localmente
+    if params.query:
+        _ledger_safe_record(key, content, tok_clean)
+        top, engine = rank_chunks(content, params.query, top_k=params.top_k)
+        delivered = sum(_tokens(c.text) for c in top)
+        _stats["tokens_delivered"] += delivered
+        return _j({
+            "status": "chunks",
+            **base,
+            "query": params.query,
+            "engine": engine,
+            "tokens_delivered": delivered,
+            "saved_vs_full_pct": round((1 - delivered / max(1, tok_clean)) * 100, 1),
+            "chunks": [
+                {"lines": f"{c.start_line}-{c.end_line}", "score": c.score, "text": c.text}
+                for c in top
+            ],
+            "note": "fragmentos EXACTOS del archivo — para más contexto repetir con otra query o top_k mayor",
+        })
+
+    # Grande sin query → mapa estructural
+    outline = build_outline(content)
+    _ledger_safe_record(key, content, tok_clean, outline=outline)
+    head = "\n".join(content.split("\n")[:25])
+    _stats["tokens_delivered"] += _tokens(head) + _tokens("\n".join(outline))
+    return _j({
+        "status": "map",
+        **base,
+        "total_lines": content.count("\n") + 1,
+        "total_chunks": len(chunk_text(content)),
+        "head": head,
+        "outline": outline,
+        "hint": "archivo grande — llamá de nuevo con `query` para obtener los fragmentos relevantes",
+    })
 
 
-@mcp.tool(
-    name="router_read_many",
-    annotations={
-        "title": "Leer Múltiples Archivos con Compresión Paralela",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-async def router_read_many(params: ReadManyInput) -> str:
-    """
-    Lee múltiples archivos en paralelo, aplica tier detection y compresión a cada uno,
-    y entrega un único bloque de contexto consolidado listo para Claude.
-
-    Tier 0 (código, configs) → raw, integridad garantizada
-    Tier 1 (< 500 tokens)   → raw, compresión no rentable
-    Tier 2+ (docs largos)   → comprimido via Groq/OpenRouter
-
-    Graceful degradation: archivos no encontrados se reportan en metadata
-    sin interrumpir el procesamiento de los archivos válidos.
-    """
-    await cache.init()
-
-    errors = []
-    valid_paths = []
-
-    for path_str in params.paths:
-        p = Path(path_str)
-        if not p.exists():
-            errors.append({"path": path_str, "error": "archivo no encontrado"})
-        elif not p.is_file():
-            errors.append({"path": path_str, "error": "no es un archivo"})
-        else:
-            valid_paths.append(p)
-
-    if not valid_paths:
-        return json.dumps({
-            "status": "error",
-            "reason": "Ningún archivo válido encontrado",
-            "errors": errors,
-        }, ensure_ascii=False)
-
-    async def read_file(p: Path) -> tuple:
-        try:
-            content = p.read_text(encoding="utf-8", errors="replace")
-            return p, content, None
-        except Exception as e:
-            return p, "", str(e)
-
-    read_results = await asyncio.gather(*[read_file(p) for p in valid_paths])
-
-    for p, _, err in read_results:
-        if err:
-            errors.append({"path": str(p), "error": err})
-
-    async def process_file(p: Path, content: str) -> dict:
-        tier = tier_detector.detect(content, file_path=str(p))
-        token_count = tier_detector.estimate_tokens(content)
-
-        if tier == Tier.ZERO or token_count < 500:
-            return {
-                "name": p.name, "path": str(p), "status": "raw",
-                "tier": tier.value, "content": content,
-                "tokens_original": token_count, "tokens_result": token_count,
-                "savings_pct": 0, "provider": "none",
-            }
-
-        cache_key = RouterCache.hash(content)
-        if params.use_cache:
-            cached = await cache.get(cache_key)
-            if cached:
-                cached_tokens = tier_detector.estimate_tokens(cached)
-                _session_stats["cache_hits"] += 1
-                return {
-                    "name": p.name, "path": str(p), "status": "cache_hit",
-                    "tier": tier.value, "content": cached,
-                    "tokens_original": token_count, "tokens_result": cached_tokens,
-                    "savings_pct": round((1 - cached_tokens / token_count) * 100, 1),
-                    "provider": "cache",
-                }
-
-        compressed, provider, success = await compressor.compress(content, level=params.level)
-        if success:
-            compressed_tokens = tier_detector.estimate_tokens(compressed)
-            if params.use_cache:
-                await cache.set(cache_key, compressed, provider=provider)
-            _session_stats["tokens_original"] += token_count
-            _session_stats["tokens_compressed"] += compressed_tokens
-            return {
-                "name": p.name, "path": str(p), "status": "compressed",
-                "tier": tier.value, "content": compressed,
-                "tokens_original": token_count, "tokens_result": compressed_tokens,
-                "savings_pct": round((1 - compressed_tokens / token_count) * 100, 1),
-                "provider": provider,
-            }
-
-        return {
-            "name": p.name, "path": str(p), "status": "raw_fallback",
-            "tier": tier.value, "content": content,
-            "tokens_original": token_count, "tokens_result": token_count,
-            "savings_pct": 0, "provider": "none",
-        }
-
-    file_results = await asyncio.gather(*[
-        process_file(p, content)
-        for p, content, err in read_results if not err
-    ])
-
-    context_parts = []
-    total_original = 0
-    total_result = 0
-
-    for fr in file_results:
-        header = (
-            f"=== {fr['name']} | tier:{fr['tier']} | "
-            f"{fr['status']} | {fr['tokens_result']} tokens ==="
-        )
-        context_parts.append(f"{header}\n{fr['content']}")
-        total_original += fr["tokens_original"]
-        total_result += fr["tokens_result"]
-
-    total_savings = round((1 - total_result / total_original) * 100, 1) if total_original > 0 else 0
-
-    return json.dumps({
-        "status": "ok",
-        "files_processed": len(file_results),
-        "files_skipped": len(errors),
-        "tokens_original": total_original,
-        "tokens_result": total_result,
-        "savings_pct": total_savings,
-        "errors": errors or None,
-        "context": "\n\n".join(context_parts),
-    }, ensure_ascii=False)
-
+# ─────────────────────────────────────────────
+# Tool 2: bulk_process — Offload masivo con failover transparente
+# ─────────────────────────────────────────────
 
 @mcp.tool(
-    name="router_extract_actions",
+    name="router_bulk_process",
     annotations={
-        "title": "Extraer Decisiones y Action Items de Texto",
+        "title": "Procesamiento Masivo en Modelos Gratuitos",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
     },
 )
-async def router_extract_actions(params: ExtractActionsInput) -> str:
+async def router_bulk_process(params: BulkProcessInput) -> str:
     """
-    Extrae decisiones, action items y preguntas abiertas de texto no estructurado.
-    Funciona con notas de reunión, hilos de email, transcripciones de calls.
+    Procesa N archivos o textos en paralelo contra modelos gratuitos (Groq → OpenRouter)
+    y devuelve un único JSON consolidado. Claude no ve los contenidos originales:
+    solo el resultado final estructurado.
 
-    Si el texto supera 3000 tokens, lo comprime primero antes de enviar a Groq.
-    Output en markdown (para lectura) o JSON (para procesamiento automático).
+    Ideal para: clasificar lotes, extraer campos de facturas/emails/transcripciones,
+    resumir muchos documentos, mapear datos no estructurados a un esquema.
+    NO usar para: código crítico, decisiones arquitecturales, razonamiento complejo.
+
+    Failover transparente: si un proveedor cae, rota al siguiente; si todos fallan
+    para un item, el item se reporta como fallido sin romper el lote.
+    Caché SHA-256: mismo item + misma instrucción = resultado instantáneo sin API.
     """
     await cache.init()
 
-    groq_key = os.getenv("GROQ_API_KEY", "")
-    openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
+    schema_part = f"\nRespondé EXACTAMENTE con este esquema JSON:\n{params.output_schema}" if params.output_schema else ""
+    sem = asyncio.Semaphore(BULK_MAX_CONCURRENCY)
 
-    estimated_tokens = len(params.text) // 4
-    text_to_process = params.text
-
-    if estimated_tokens > 3000:
-        compressed, _, success = await compressor.compress(params.text, level="medium")
-        if success:
-            text_to_process = compressed
-
-    extraction_prompt = f"""Analizá el siguiente texto y extraé información estructurada.
-
-Respondé ÚNICAMENTE con un objeto JSON válido con exactamente estas claves:
-{{
-  "decisions": ["decisión concreta 1", "decisión concreta 2"],
-  "action_items": [
-    {{"task": "descripción de la tarea", "owner": "nombre o null", "deadline": "fecha o null"}}
-  ],
-  "open_questions": ["pregunta sin resolver 1"],
-  "executive_summary": "máximo 3 oraciones describiendo el contenido"
-}}
-
-Reglas:
-- decisions: solo hechos acordados, no intenciones vagas
-- action_items: solo tareas concretas y accionables
-- open_questions: temas sin resolución que requieren seguimiento
-- Si no hay elementos en una categoría, dejá el array vacío []
-
-Texto:
-{text_to_process}"""
-
-    result_data = None
-    provider_used = "none"
-
-    if groq_key:
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": "llama-3.1-8b-instant",
-                        "messages": [{"role": "user", "content": extraction_prompt}],
-                        "max_tokens": 2048,
-                        "temperature": 0.05,
-                        "response_format": {"type": "json_object"},
-                    },
-                    timeout=25.0,
-                )
-                response.raise_for_status()
-            content = response.json()["choices"][0]["message"].get("content")
-            if content:
-                result_data = json.loads(content)
-                provider_used = "groq"
-        except Exception as e:
-            logger.warning(f"Groq extract_actions falló: {e}")
-
-    if result_data is None and openrouter_key:
-        for model in ["qwen/qwen-2.5-7b-instruct:free", "meta-llama/llama-3.2-3b-instruct:free"]:
+    def load_item(item: str) -> tuple[str, str]:
+        """Returns (nombre, contenido). Si parece ruta y existe, lee el archivo."""
+        if len(item) < 500:
+            p = Path(item)
             try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {openrouter_key}",
-                            "HTTP-Referer": "https://individratec.com",
-                        },
-                        json={
-                            "model": model,
-                            "messages": [{"role": "user", "content": extraction_prompt}],
-                            "max_tokens": 2048,
-                            "temperature": 0.05,
-                        },
-                        timeout=45.0,
-                    )
-                    response.raise_for_status()
-                content = response.json()["choices"][0]["message"].get("content")
-                if content:
-                    match = re.search(r'\{.*\}', content, re.DOTALL)
-                    if match:
-                        result_data = json.loads(match.group())
-                        provider_used = model
-                        break
-            except Exception as e:
-                logger.warning(f"OpenRouter {model} extract_actions falló: {e}")
+                if p.is_file():
+                    raw = p.read_text(encoding="utf-8", errors="replace")
+                    clean, _ = sanitize_file_content(raw, str(p))
+                    return p.name, clean
+            except Exception:
+                pass
+        return f"text_{abs(hash(item)) % 10000}", item
+
+    async def process(idx: int, item: str) -> dict:
+        name, content = load_item(item)
+        if len(content) > BULK_ITEM_MAX_CHARS:
+            content = content[:BULK_ITEM_MAX_CHARS] + "\n[...truncado]"
+
+        prompt = (
+            f"{params.instruction}{schema_part}\n"
+            "Respondé SOLO con el resultado, sin introducción ni explicación.\n"
+            f"---\n{content}"
+        )
+        cache_key = RouterCache.hash(prompt)
+        cached = await cache.get(cache_key)
+        if cached:
+            _stats["cache_hits"] += 1
+            return {"i": idx, "src": name, "out": cached, "provider": "cache"}
+
+        async with sem:
+            result, provider = await llm.call(
+                prompt, max_tokens=1500, json_mode=bool(params.output_schema)
+            )
+        if result is None:
+            _stats["bulk_items_failed"] += 1
+            return {"i": idx, "src": name, "error": "todos los proveedores fallaron"}
+
+        _stats["api_calls"] += 1
+        _stats["bulk_items_processed"] += 1
+        _stats["tokens_file_total"] += _tokens(content)
+        await cache.set(cache_key, result, provider=provider)
+        return {"i": idx, "src": name, "out": result, "provider": provider}
+
+    results = await asyncio.gather(*[process(i, item) for i, item in enumerate(params.items)])
+    ok = [r for r in results if "out" in r]
+    failed = [r for r in results if "error" in r]
+
+    response = {
+        "status": "ok" if ok else "failed",
+        "processed": len(ok),
+        "failed": len(failed),
+        "results": results,
+    }
+
+    if params.mode == "map_reduce" and len(ok) > 1:
+        joined = "\n".join(f"[{r['src']}]: {r['out']}" for r in ok)[:BULK_ITEM_MAX_CHARS]
+        reduce_prompt = (
+            f"Los siguientes son resultados por-item de la tarea: '{params.instruction}'.\n"
+            "Consolidalos en un único resumen/estructura global. Respondé SOLO con el resultado.\n"
+            f"---\n{joined}"
+        )
+        reduced, provider = await llm.call(reduce_prompt, max_tokens=2000)
+        if reduced:
+            _stats["api_calls"] += 1
+            response["reduced"] = reduced
+            response["reduce_provider"] = provider
+        else:
+            response["reduced"] = None
+            response["reduce_note"] = "consolidación falló — usar resultados por item"
+
+    delivered = _tokens(_j(response))
+    _stats["tokens_delivered"] += delivered
+    return _j(response)
+
+
+# ─────────────────────────────────────────────
+# Tool 3: checkpoint — handoff de contexto entre sesiones y clientes
+# ─────────────────────────────────────────────
+
+def _safe_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60] or "latest"
+
+
+@mcp.tool(
+    name="router_checkpoint",
+    annotations={
+        "title": "Checkpoint/Resume de Sesión (cross-cliente)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def router_checkpoint(params: CheckpointInput) -> str:
+    """
+    Traspaso de contexto entre sesiones y clientes (Desktop, Code, Cowork comparten esto).
+
+    save: guardá resumen, decisiones, pendientes y archivos relevantes al cerrar
+          una tarea larga o cuando el contexto se llena. Persiste en disco como
+          JSON legible (checkpoints/{name}.json) — el usuario puede editarlo.
+    resume: una sesión nueva restaura todo en ~300 tokens, e indica qué archivos
+            cambiaron en disco desde el checkpoint (via hash) — sin re-leerlos.
+    list: checkpoints disponibles con fecha y resumen.
+    """
+    _checkpoints_dir.mkdir(exist_ok=True)
+
+    if params.action == "save":
+        if not params.summary:
+            return _j({"status": "error", "reason": "save requiere `summary`"})
+        name = _safe_name(params.name or "latest")
+        files_entry = []
+        for f in params.files or []:
+            p = Path(f)
+            h = None
+            if p.is_file():
+                try:
+                    h = FileLedger.hash(p.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    pass
+            files_entry.append({"path": f, "hash": h})
+        data = {
+            "name": name,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M"),
+            "ts": time.time(),
+            "summary": params.summary,
+            "decisions": params.decisions or [],
+            "open_items": params.open_items or [],
+            "files": files_entry,
+        }
+        path = _checkpoints_dir / f"{name}.json"
+        path.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
+        return _j({"status": "saved", "name": name, "path": str(path), "files_tracked": len(files_entry)})
+
+    if params.action == "list":
+        items = []
+        for p in sorted(_checkpoints_dir.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+                items.append({"name": d.get("name", p.stem), "saved_at": d.get("saved_at"), "summary": (d.get("summary") or "")[:120]})
+            except Exception:
                 continue
+        return _j({"status": "ok", "checkpoints": items})
 
-    if result_data is None:
-        return json.dumps({
-            "status": "error",
-            "reason": "Todos los proveedores fallaron — intentar con texto más corto",
-        }, ensure_ascii=False)
+    # resume
+    if params.name:
+        path = _checkpoints_dir / f"{_safe_name(params.name)}.json"
+        if not path.exists():
+            return _j({"status": "error", "reason": f"checkpoint '{params.name}' no existe — usar action=list"})
+    else:
+        candidates = sorted(_checkpoints_dir.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if not candidates:
+            return _j({"status": "empty", "reason": "no hay checkpoints guardados"})
+        path = candidates[0]
 
-    if params.output_format == "markdown":
-        md = []
-        if result_data.get("executive_summary"):
-            md.append(f"## Resumen\n{result_data['executive_summary']}\n")
-        if result_data.get("decisions"):
-            md.append("## Decisiones tomadas")
-            for d in result_data["decisions"]:
-                md.append(f"- {d}")
-            md.append("")
-        if result_data.get("action_items"):
-            md.append("## Action items")
-            for ai in result_data["action_items"]:
-                owner = f" — **{ai['owner']}**" if ai.get("owner") else ""
-                deadline = f" `{ai['deadline']}`" if ai.get("deadline") else ""
-                md.append(f"- [ ] {ai['task']}{owner}{deadline}")
-            md.append("")
-        if result_data.get("open_questions"):
-            md.append("## Preguntas abiertas")
-            for q in result_data["open_questions"]:
-                md.append(f"- {q}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return _j({"status": "error", "reason": f"checkpoint corrupto: {e}"})
 
-        return json.dumps({
-            "status": "ok",
-            "provider": provider_used,
-            "tokens_input": estimated_tokens,
-            "output": "\n".join(md),
-        }, ensure_ascii=False)
+    file_states = ledger.check_files(data.get("files", []))
+    changed = [f["path"] for f in file_states if f["state"] == "changed"]
+    return _j({
+        "status": "resumed",
+        "name": data.get("name"),
+        "saved_at": data.get("saved_at"),
+        "summary": data.get("summary"),
+        "decisions": data.get("decisions"),
+        "open_items": data.get("open_items"),
+        "files": file_states,
+        "hint": (
+            f"archivos modificados desde el checkpoint: {changed} — leelos con router_smart_read para ver solo los diffs"
+            if changed else "ningún archivo relevante cambió desde el checkpoint"
+        ),
+    })
 
-    return json.dumps({
-        "status": "ok",
-        "provider": provider_used,
-        "tokens_input": estimated_tokens,
-        "output": result_data,
-    }, ensure_ascii=False)
 
+# ─────────────────────────────────────────────
+# Tool 4: status — métricas honestas + diagnóstico
+# ─────────────────────────────────────────────
 
 @mcp.tool(
     name="router_status",
     annotations={
-        "title": "Estado del Router MCP",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-async def router_status() -> str:
-    """
-    Estado actual del router: circuit breakers, tokens ahorrados en la sesión,
-    estadísticas del caché y proveedores configurados.
-    """
-    await cache.init()
-    cache_stats = await cache.get_stats()
-
-    session_duration = round(time.time() - _session_stats["start_time"])
-    tokens_saved = _session_stats["tokens_original"] - _session_stats["tokens_compressed"]
-    savings_pct = (
-        round(tokens_saved / _session_stats["tokens_original"] * 100, 1)
-        if _session_stats["tokens_original"] > 0
-        else 0
-    )
-
-    status = {
-        "router_version": "1.0.0",
-        "mode": CONFIG.get("mode", "personal"),
-        "session_duration_seconds": session_duration,
-        "providers_configured": {
-            "gemini": bool(os.getenv("GEMINI_API_KEY")),
-            "groq": bool(os.getenv("GROQ_API_KEY")),
-            "openrouter": bool(os.getenv("OPENROUTER_API_KEY")),
-        },
-        "circuit_breakers": circuit_breaker.get_status(),
-        "session_stats": {
-            "tokens_original": _session_stats["tokens_original"],
-            "tokens_after_compression": _session_stats["tokens_compressed"],
-            "tokens_saved": tokens_saved,
-            "savings_pct": savings_pct,
-            "cache_hits": _session_stats["cache_hits"],
-            "api_calls_gemini": _session_stats["api_calls_gemini"],
-            "api_calls_openrouter": _session_stats["api_calls_openrouter"],
-            "tasks_routed": _session_stats["tasks_routed"],
-        },
-        "cache": cache_stats,
-    }
-
-    return json.dumps(status, indent=2, ensure_ascii=False)
-
-
-# ─────────────────────────────────────────────
-# Herramienta de diagnóstico
-# ─────────────────────────────────────────────
-
-@mcp.tool(
-    name="router_diagnose",
-    annotations={
-        "title": "Diagnosticar Conectividad de Proveedores",
+        "title": "Estado y Diagnóstico del MCP",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
     },
 )
-async def router_diagnose() -> str:
+async def router_status(params: StatusInput) -> str:
     """
-    Testea la conectividad real con Gemini y OpenRouter.
-    Devuelve el error exacto si algo falla. Usar para diagnóstico.
+    Métricas de la sesión (tokens que NO entraron al contexto de Claude, cache, llamadas)
+    y estado de circuit breakers. Con deep=true testea conectividad real de proveedores.
     """
-    import httpx
-    import sys
-
-    results = {}
-
-    # Test Groq
-    groq_key = os.getenv("GROQ_API_KEY", "")
-    if not groq_key:
-        results["groq"] = {"status": "error", "detail": "GROQ_API_KEY no configurada"}
-    else:
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {groq_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "llama-3.1-8b-instant",
-                        "messages": [{"role": "user", "content": "Reply with just the word OK"}],
-                        "max_tokens": 10,
-                        "temperature": 0.1,
-                    },
-                    timeout=15.0,
-                )
-            if response.status_code == 200:
-                data = response.json()
-                reply = data["choices"][0]["message"].get("content", "")
-                results["groq"] = {"status": "ok", "response": reply.strip(), "model": "llama-3.1-8b-instant"}
-            else:
-                results["groq"] = {
-                    "status": "error",
-                    "http_code": response.status_code,
-                    "detail": response.text[:500],
-                }
-        except Exception as e:
-            results["groq"] = {"status": "exception", "type": type(e).__name__, "detail": str(e)[:300]}
-
-    # Test OpenRouter — prueba en cascada hasta encontrar uno que funcione
-    openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
-    if not openrouter_key:
-        results["openrouter"] = {"status": "error", "detail": "OPENROUTER_API_KEY no configurada"}
-    else:
-        _or_test_models = [
-            "qwen/qwen-2.5-7b-instruct:free",
-            "meta-llama/llama-3.2-3b-instruct:free",
-            "deepseek/deepseek-r1-distill-llama-70b:free",
-        ]
-        _or_result = {"status": "error", "detail": "Todos los modelos fallaron"}
-        for _or_model in _or_test_models:
-            try:
-                async with httpx.AsyncClient() as client:
-                    _or_resp = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {openrouter_key}",
-                            "HTTP-Referer": "https://individratec.com",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": _or_model,
-                            "messages": [{"role": "user", "content": "Reply with just the word OK"}],
-                            "max_tokens": 10,
-                        },
-                        timeout=20.0,
-                    )
-                if _or_resp.status_code == 200:
-                    _or_data = _or_resp.json()
-                    _or_reply = _or_data["choices"][0]["message"].get("content")
-                    if _or_reply:
-                        _or_result = {"status": "ok", "response": _or_reply.strip(), "model": _or_model}
-                        break
-                    else:
-                        _or_result = {"status": "warn", "detail": f"{_or_model}: content=None (model filter)", "model": _or_model}
-                elif _or_resp.status_code == 429:
-                    _or_result = {"status": "warn", "http_code": 429, "detail": f"{_or_model}: rate limit transitorio", "model": _or_model}
-                    break  # 429 es transitorio — no seguir probando
-                else:
-                    _or_result = {"status": "error", "http_code": _or_resp.status_code, "detail": f"{_or_model}: {_or_resp.text[:200]}"}
-            except Exception as _or_e:
-                _or_result = {"status": "exception", "type": type(_or_e).__name__, "detail": str(_or_e)[:200], "model": _or_model}
-        results["openrouter"] = _or_result
-
-    # Info del entorno
-    results["env"] = {
-        "python_version": sys.version,
-        "groq_key_prefix": groq_key[:8] + "..." if groq_key else "N/A",
-        "openrouter_key_prefix": openrouter_key[:8] + "..." if openrouter_key else "N/A",
+    await cache.init()
+    saved = max(0, _stats["tokens_file_total"] - _stats["tokens_delivered"])
+    status = {
+        "version": VERSION,
+        "uptime_s": round(time.time() - _stats["start_time"]),
+        "providers": {
+            "groq": bool(os.getenv("GROQ_API_KEY")),
+            "openrouter": bool(os.getenv("OPENROUTER_API_KEY")),
+        },
+        "circuit_breakers": circuit_breaker.get_status() or None,
+        "session": {
+            "smart_reads": _stats["smart_reads"],
+            "unchanged_hits": _stats["unchanged_hits"],
+            "diff_reads": _stats["diff_reads"],
+            "bulk_processed": _stats["bulk_items_processed"],
+            "bulk_failed": _stats["bulk_items_failed"],
+            "api_calls": _stats["api_calls"],
+            "cache_hits": _stats["cache_hits"],
+            "tokens_source_total": _stats["tokens_file_total"],
+            "tokens_delivered_to_claude": _stats["tokens_delivered"],
+            "tokens_kept_out_of_context": saved,
+        },
+        "ledger": ledger.stats(),
+        "cache": await cache.get_stats(),
     }
 
-    return json.dumps(results, indent=2, ensure_ascii=False)
+    if params.deep:
+        diag = {}
+        groq_key = os.getenv("GROQ_API_KEY", "")
+        if groq_key:
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.post(
+                        GROQ_API_URL,
+                        headers={"Authorization": f"Bearer {groq_key}"},
+                        json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": "OK"}], "max_tokens": 5},
+                        timeout=15.0,
+                    )
+                diag["groq"] = {"http": r.status_code, "model": GROQ_MODEL}
+            except Exception as e:
+                diag["groq"] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
+        else:
+            diag["groq"] = {"error": "GROQ_API_KEY no configurada"}
+
+        or_key = os.getenv("OPENROUTER_API_KEY", "")
+        if or_key:
+            diag["openrouter"] = {"models": []}
+            for model in OPENROUTER_FREE_MODELS:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        r = await client.post(
+                            OPENROUTER_API_URL,
+                            headers={"Authorization": f"Bearer {or_key}"},
+                            json={"model": model, "messages": [{"role": "user", "content": "OK"}], "max_tokens": 5},
+                            timeout=20.0,
+                        )
+                    diag["openrouter"]["models"].append({"m": model, "http": r.status_code})
+                except Exception as e:
+                    diag["openrouter"]["models"].append({"m": model, "error": str(e)[:100]})
+        else:
+            diag["openrouter"] = {"error": "OPENROUTER_API_KEY no configurada"}
+
+        try:
+            from router.ranker import _get_embedder
+            diag["fastembed"] = "activo" if _get_embedder() else "no instalado (BM25 puro)"
+        except Exception:
+            diag["fastembed"] = "no instalado (BM25 puro)"
+
+        diag["python"] = sys.version.split()[0]
+        status["diagnostics"] = diag
+
+    return _j(status)
 
 
 # ─────────────────────────────────────────────
@@ -933,5 +642,5 @@ async def router_diagnose() -> str:
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logger.info("INDIVIDRA MCP Router iniciado ✓")
+    logger.info(f"INDIVIDRA MCP v{VERSION} — Context Ingestion & Bulk Offload Engine ✓")
     mcp.run()

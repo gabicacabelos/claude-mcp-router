@@ -30,3 +30,6 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Checkpoints personales de sesión
+checkpoints/
