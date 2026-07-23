@@ -19,7 +19,7 @@ Claude es amnésico entre sesiones y ciego entre clientes: lo que leíste en Cla
 - Un "ahorrador mágico de tokens" para tu chat diario. Si tu sesión es conversación normal, esto no te ayuda — y ninguna herramienta lo hará.
 - Un compresor de código. Comprimir código con LLMs baratos degrada las respuestas de Claude y termina costando más tokens en reintentos. Por eso v2 eliminó esa función.
 
-## Las 4 herramientas
+## Las 5 herramientas
 
 ### `router_smart_read` — Lectura quirúrgica con memoria (local, $0, sin APIs)
 
@@ -49,6 +49,24 @@ checkpoint(action="save", name="refactor-auth",
 ```
 
 Al cerrar una tarea larga (o cuando el contexto se llena), Claude guarda el estado como JSON legible en `checkpoints/` — editable por vos, compartible con tu equipo. Una sesión nueva —en Desktop, Code o Cowork, da igual— hace `action="resume"` y recupera todo en ~300 tokens, **incluyendo qué archivos cambiaron en disco desde el checkpoint** (comparación por hash, sin re-leerlos). `action="list"` muestra los checkpoints disponibles.
+
+### `router_inbox` — Órdenes cruzadas entre clientes
+
+```
+# En Cowork:
+inbox(action="send", to="code", message="migrá los tests a pytest",
+      checkpoint="refactor-auth")
+
+# En Claude Code, al arrancar:
+inbox(action="check", to="code")
+→ la orden + el resumen del checkpoint vinculado
+inbox(action="complete", order_id=1, result="34/34 tests verdes")
+
+# De vuelta en Cowork:
+inbox(action="history")  → ves el resultado
+```
+
+Los chats de Claude no pueden comandarse entre sí en tiempo real — pero comparten este disco. El inbox es el buzón asíncrono: dejás una orden desde un cliente (vinculada a un checkpoint para que el receptor tenga todo el contexto de lo que estaban haciendo), el otro la consume al arrancar, la ejecuta y reporta el resultado. Decile a Cowork *"dejale esta tarea a Claude Code"* y listo — las `instructions` del servidor hacen que cada cliente chequee su buzón al empezar a trabajar.
 
 ### `router_bulk_process` — Offload masivo con failover transparente
 
@@ -147,6 +165,7 @@ smart_read ──▶ sanitizer (HTML/texto, local) ──▶ ledger (¿ya lo vi?
                           ├─ fastembed (bge-small, ONNX local) si está
                           └─ BM25 puro-Python (fallback, 0 deps)
 checkpoint ──▶ checkpoints/*.json (legible/editable) + verificación de hashes al resumir
+inbox ──────▶ cola SQLite compartida (órdenes entre Cowork/Code/Desktop + resultados)
 bulk_process ─▶ caché SHA-256 (SQLite) ──▶ CheapLLM
                                             ├─ Groq llama-3.1-8b (LPU, rápido)
                                             ├─ OpenRouter :free (rotación de modelos)

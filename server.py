@@ -46,6 +46,7 @@ from mcp.server.fastmcp import FastMCP
 
 from router.cache import RouterCache
 from router.circuit_breaker import CircuitBreaker
+from router.inbox import Inbox
 from router.ledger import FileLedger
 from router.providers import CheapLLM, GROQ_API_URL, GROQ_MODEL, OPENROUTER_API_URL, get_free_models
 from router.ranker import build_outline, chunk_text, rank_chunks
@@ -81,6 +82,7 @@ circuit_breaker = CircuitBreaker(
 )
 llm = CheapLLM(circuit_breaker=circuit_breaker)
 ledger = FileLedger(db_path=str(_server_dir / "cache" / "ledger.db"))
+inbox = Inbox(db_path=str(_server_dir / "cache" / "inbox.db"))
 _checkpoints_dir = _server_dir / "checkpoints"
 
 _stats = {
@@ -96,7 +98,7 @@ _stats = {
     "diff_reads": 0,
 }
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # Umbral: archivos por debajo se devuelven enteros (el overhead de RAG no rinde)
 FULL_RETURN_MAX_TOKENS = 1500
@@ -129,7 +131,8 @@ INSTRUCTIONS = """Suite de ingesta de contexto y procesamiento masivo con memori
 1. router_smart_read: para leer un archivo grande (>15KB) o buscar algo puntual en cualquier archivo, pasá `query` con lo que buscás — devuelve solo los fragmentos exactos relevantes con números de línea (ranking local, sin pérdida). Sin `query` devuelve el mapa estructural. MEMORIA: si el archivo ya fue leído en una sesión anterior y no cambió, devuelve solo el outline (~50 tokens); si cambió, devuelve SOLO el diff. Usá `force_full=true` si necesitás el contenido completo igual.
 2. router_bulk_process: para tareas repetitivas sobre muchos archivos o textos (clasificar, extraer campos, resumir N items) — procesa en paralelo con modelos gratuitos externos y devuelve un JSON consolidado. No usar para código crítico ni razonamiento complejo.
 3. router_checkpoint: al cerrar una tarea larga o cuando el contexto se está llenando, guardá un checkpoint (action=save) con resumen, decisiones y pendientes. Al arrancar una sesión sobre trabajo previo, action=resume lo restaura en ~300 tokens e indica qué archivos cambiaron desde entonces.
-4. router_status: métricas de ahorro y diagnóstico de proveedores.
+4. router_inbox: buzón de órdenes entre clientes (Cowork/Code/Desktop). Si el usuario dice "dejale esta tarea a Claude Code" o similar: action=send con la orden y un checkpoint vinculado. AL INICIO de sesiones de trabajo, chequeá órdenes pendientes con action=check; al ejecutarlas marcá complete con el resultado.
+5. router_status: métricas de ahorro y diagnóstico de proveedores.
 Todas las salidas vienen en JSON minificado."""
 
 mcp = FastMCP("individra_router_mcp", instructions=INSTRUCTIONS)
@@ -196,6 +199,24 @@ class CheckpointInput(BaseModel):
         default=None,
         description="[save] Rutas de archivos relevantes a la tarea — al hacer resume se reporta cuáles cambiaron",
     )
+
+
+class InboxInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    action: Literal["send", "check", "complete", "history"] = Field(
+        ...,
+        description="send=dejar una orden para otro cliente | check=ver órdenes pendientes | complete=marcar hecha con resultado | history=últimas completadas",
+    )
+    message: Optional[str] = Field(default=None, description="[send] La orden/instrucción a dejar")
+    to: Optional[str] = Field(default=None, description="[send/check] Cliente destino: 'code', 'cowork', 'desktop' o 'any' (default)")
+    from_client: Optional[str] = Field(default=None, description="[send] Quién deja la orden: 'cowork', 'code', 'desktop'")
+    checkpoint: Optional[str] = Field(
+        default=None,
+        description="[send] Nombre de checkpoint vinculado — el receptor lo puede resumir para ver el contexto completo de la tarea",
+    )
+    order_id: Optional[int] = Field(default=None, description="[complete] ID de la orden a marcar como hecha")
+    result: Optional[str] = Field(default=None, description="[complete] Resultado/resumen de lo ejecutado, visible para quien dejó la orden")
 
 
 class StatusInput(BaseModel):
@@ -545,7 +566,87 @@ async def router_checkpoint(params: CheckpointInput) -> str:
 
 
 # ─────────────────────────────────────────────
-# Tool 4: status — métricas honestas + diagnóstico
+# Tool 4: inbox — órdenes cruzadas entre clientes
+# ─────────────────────────────────────────────
+
+@mcp.tool(
+    name="router_inbox",
+    annotations={
+        "title": "Inbox de Órdenes entre Clientes (Cowork ↔ Code ↔ Desktop)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def router_inbox(params: InboxInput) -> str:
+    """
+    Buzón asíncrono entre clientes de Claude. Los chats no pueden comandarse
+    en tiempo real, pero comparten este disco: acá un cliente deja órdenes
+    y otro las consume, ejecuta y reporta.
+
+    send: dejá una orden (ej. desde Cowork para Claude Code), opcionalmente
+          vinculada a un checkpoint para que el receptor tenga todo el contexto.
+    check: al arrancar una sesión, mirá si hay órdenes pendientes para vos.
+    complete: marcá la orden hecha con un resumen del resultado.
+    history: qué se completó y con qué resultado.
+    """
+    try:
+        if params.action == "send":
+            if not params.message:
+                return _j({"status": "error", "reason": "send requiere `message`"})
+            if params.checkpoint:
+                cp_path = _checkpoints_dir / f"{_safe_name(params.checkpoint)}.json"
+                if not cp_path.exists():
+                    return _j({"status": "error", "reason": f"checkpoint '{params.checkpoint}' no existe — guardalo primero con router_checkpoint"})
+            oid = inbox.send(
+                message=params.message,
+                to_client=params.to or "any",
+                from_client=params.from_client or "unknown",
+                checkpoint=params.checkpoint,
+            )
+            return _j({
+                "status": "sent", "id": oid, "to": params.to or "any",
+                "checkpoint": params.checkpoint,
+                "note": "el destinatario la verá con router_inbox action=check",
+            })
+
+        if params.action == "check":
+            orders = inbox.check(to_client=params.to)
+            # adjuntar resumen del checkpoint vinculado para dar contexto sin otra llamada
+            for o in orders:
+                if o.get("checkpoint"):
+                    cp_path = _checkpoints_dir / f"{_safe_name(o['checkpoint'])}.json"
+                    if cp_path.exists():
+                        try:
+                            cp = json.loads(cp_path.read_text(encoding="utf-8"))
+                            o["checkpoint_summary"] = (cp.get("summary") or "")[:200]
+                        except Exception:
+                            pass
+            hint = (
+                "ejecutá las órdenes; usá router_checkpoint action=resume con el checkpoint vinculado para el contexto completo; al terminar marcá complete con el resultado"
+                if orders else "sin órdenes pendientes"
+            )
+            return _j({"status": "ok", "pending": len(orders), "orders": orders, "hint": hint})
+
+        if params.action == "complete":
+            if not params.order_id:
+                return _j({"status": "error", "reason": "complete requiere `order_id`"})
+            ok = inbox.complete(params.order_id, result=params.result)
+            if not ok:
+                return _j({"status": "error", "reason": f"orden {params.order_id} no existe o ya estaba completada"})
+            return _j({"status": "completed", "id": params.order_id})
+
+        # history
+        return _j({"status": "ok", "completed": inbox.history()})
+
+    except Exception as e:
+        logger.warning(f"inbox error: {e}")
+        return _j({"status": "error", "reason": str(e)[:200]})
+
+
+# ─────────────────────────────────────────────
+# Tool 5: status — métricas honestas + diagnóstico
 # ─────────────────────────────────────────────
 
 @mcp.tool(
