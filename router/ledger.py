@@ -79,6 +79,18 @@ class FileLedger:
                 PRIMARY KEY (file_hash, chunk_idx)
             )
         """)
+        # Índice de proyecto: un doc por archivo indexado, con el hash del
+        # contenido para re-indexar SOLO lo que cambió (invalidación incremental).
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS project_index (
+                path TEXT PRIMARY KEY,
+                root TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                tokens TEXT NOT NULL,
+                indexed_at REAL NOT NULL
+            )
+        """)
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_project_index_root ON project_index(root)")
         # Tabla de paso de la captura pasiva: el hook hace UN insert y se va.
         # Deliberadamente tonta (sin hash ni snapshot) para que el hook termine
         # en microsegundos; el MCP la promueve al ledger real cuando le conviene.
@@ -279,6 +291,43 @@ class FileLedger:
             state = "unchanged" if current == f.get("hash") else "changed"
             out.append({"path": f["path"], "state": state})
         return out
+
+    # ─── Índice de proyecto (búsqueda cross-archivo) ──────────────────────────
+
+    def indexed_hash(self, path: str) -> str | None:
+        row = self._db.execute("SELECT hash FROM project_index WHERE path=?", (path,)).fetchone()
+        return row[0] if row else None
+
+    def put_indexed(self, path: str, root: str, content_hash: str, tokens: list[str]) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO project_index (path, root, hash, tokens, indexed_at) VALUES (?,?,?,?,?)",
+            (path, root, content_hash, json.dumps(tokens, ensure_ascii=False), time.time()),
+        )
+        self._db.commit()
+
+    def drop_indexed(self, paths: list[str]) -> int:
+        if not paths:
+            return 0
+        self._db.executemany("DELETE FROM project_index WHERE path=?", [(p,) for p in paths])
+        self._db.commit()
+        return len(paths)
+
+    def indexed_docs(self, root: str) -> list[tuple[str, list[str]]]:
+        """(path, tokens) de todos los archivos indexados bajo una raíz."""
+        rows = self._db.execute(
+            "SELECT path, tokens FROM project_index WHERE root=? ORDER BY path", (root,)
+        ).fetchall()
+        out = []
+        for path, raw in rows:
+            try:
+                out.append((path, json.loads(raw)))
+            except Exception:
+                continue
+        return out
+
+    def indexed_paths(self, root: str) -> list[str]:
+        return [r[0] for r in self._db.execute(
+            "SELECT path FROM project_index WHERE root=?", (root,)).fetchall()]
 
     # ─── Captura pasiva (hooks) ───────────────────────────────────────────────
 

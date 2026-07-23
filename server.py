@@ -49,6 +49,7 @@ from router.ledger import FileLedger
 from router.ranker import build_outline, chunk_text, rank_chunks
 from router.sanitizer import sanitize_file_content
 from router import rules as project_rules
+from router import project_index
 
 # ─────────────────────────────────────────────
 # Bootstrap
@@ -104,7 +105,7 @@ _stats = {
     "diff_reads": 0,
 }
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 
 # Umbral: archivos por debajo se devuelven enteros (el overhead de RAG no rinde)
 FULL_RETURN_MAX_TOKENS = 1500
@@ -202,7 +203,8 @@ INSTRUCTIONS = """Memoria y continuidad para Claude entre sesiones y clientes �
 2. router_checkpoint: al cerrar una tarea larga o cuando el contexto se está llenando, guardá un checkpoint (action=save) con resumen, decisiones y pendientes. Al arrancar una sesión sobre trabajo previo, action=resume lo restaura en ~300 tokens e indica qué archivos cambiaron desde entonces.
 3. router_inbox: buzón de órdenes entre clientes (Cowork/Code/Desktop/Design). Si el usuario dice "dejale esta tarea a Claude Code", "pasale el diseño a Claude Design", "que Design haga el mockup" o similar: action=send con la orden, un checkpoint vinculado y `assets` (rutas/URLs de brief, wireframe, export .fig/.png) para el handoff código↔diseño. AL INICIO de sesiones de trabajo, chequeá órdenes pendientes con action=check; al ejecutarlas marcá complete con el resultado (y `assets` devueltos si generaste algo, ej. el export de un mockup).
 4. router_status: métricas de la sesión (tokens que no entraron al contexto, lecturas, checkpoints, inbox).
-5. router_rules: reglas PERMANENTES del proyecto ("nunca usar Redux", "los tests van en tests/"), distintas del estado de tarea de un checkpoint. Guardá una con action=add cuando el usuario fije una convención durable, o promové una decisión de un checkpoint con action=promote. Viven en .claude-continuity-rules.json en la raíz del proyecto (git-friendly). NO hace falta leerlas: se inyectan solas como `project_rules` en smart_read/resume. sync_to_claudemd=true además las escribe en el CLAUDE.md.
+5. router_project_search: buscá en TODO el proyecto cuando NO sabés en qué archivo está lo que buscás ("¿dónde se validan los webhooks?"). Índice BM25 local e incremental — devuelve los archivos más relevantes con fragmentos exactos. Preferilo sobre grep cuando la búsqueda es conceptual y no una cadena literal; usá router_smart_read si ya sabés el archivo.
+6. router_rules: reglas PERMANENTES del proyecto ("nunca usar Redux", "los tests van en tests/"), distintas del estado de tarea de un checkpoint. Guardá una con action=add cuando el usuario fije una convención durable, o promové una decisión de un checkpoint con action=promote. Viven en .claude-continuity-rules.json en la raíz del proyecto (git-friendly). NO hace falta leerlas: se inyectan solas como `project_rules` en smart_read/resume. sync_to_claudemd=true además las escribe en el CLAUDE.md.
 Todas las salidas vienen en JSON minificado."""
 
 mcp = FastMCP("claude_continuity_mcp", instructions=INSTRUCTIONS)
@@ -293,6 +295,19 @@ class RulesInput(BaseModel):
         default=False,
         description="True = además escribir/actualizar la sección delimitada de reglas en el CLAUDE.md del proyecto (alimenta la memoria nativa de Claude Code)",
     )
+
+
+class ProjectSearchInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    project_dir: str = Field(..., min_length=1, description="Raíz del proyecto a buscar/indexar")
+    query: Optional[str] = Field(
+        default=None,
+        description="Qué buscás en TODO el proyecto (ej: '¿dónde se validan los webhooks?'). Si se omite, solo (re)indexa.",
+    )
+    top_k: int = Field(default=5, ge=1, le=15, description="Cantidad de archivos a devolver")
+    fragments_per_file: int = Field(default=1, ge=1, le=4, description="Fragmentos exactos por archivo")
+    reindex: bool = Field(default=False, description="True = forzar el barrido de indexación antes de buscar")
 
 
 class StatusInput(BaseModel):
@@ -898,6 +913,80 @@ async def router_rules(params: RulesInput) -> str:
            "rules_file": str(project_rules.rules_path(pdir))}
     if params.sync_to_claudemd:
         out["claudemd"] = str(project_rules.sync_to_claudemd(pdir))
+    return _j(out)
+
+
+# ─────────────────────────────────────────────
+# Tool 6: project_search — búsqueda BM25 cross-archivo, incremental
+# ─────────────────────────────────────────────
+
+@mcp.tool(
+    name="router_project_search",
+    annotations={
+        "title": "Búsqueda en Todo el Proyecto (BM25 local, incremental)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def router_project_search(params: ProjectSearchInput) -> str:
+    """
+    Busca en TODO el proyecto y devuelve los archivos más relevantes con los
+    fragmentos EXACTOS de cada uno. Para "¿dónde se maneja X?" cuando no sabés
+    en qué archivo está — smart_read es por-archivo, esto es cross-archivo.
+
+    Índice incremental: la primera llamada indexa; las siguientes solo
+    re-indexan los archivos cuyo hash cambió (los sin cambios cuestan ~0), y
+    el índice persiste cross-sesión y cross-cliente.
+
+    Ventaja sobre grep: ranking por relevancia (no coincidencia literal), y
+    entiende snake_case/camelCase. Determinista, 100% local.
+    """
+    root = Path(params.project_dir)
+    if not root.is_dir():
+        return _j({"status": "error", "reason": f"project_dir no existe: {params.project_dir}"})
+
+    stats = None
+    try:
+        # Sin query (o con reindex) el barrido es explícito. Con query, igual se
+        # refresca: es incremental, así que sobre un proyecto ya indexado es barato.
+        stats = project_index.build_index(ledger, root)
+    except Exception as e:
+        logger.warning(f"indexación falló: {e}")
+        if not params.query:
+            return _j({"status": "error", "reason": f"indexación falló: {str(e)[:160]}"})
+
+    if not params.query:
+        return _j({"status": "indexed", **(stats or {}),
+                   "hint": "volvé a llamar con `query` para buscar en todo el proyecto"})
+
+    try:
+        results = project_index.search(ledger, root, params.query,
+                                       top_k=params.top_k,
+                                       fragments_per_file=params.fragments_per_file)
+    except Exception as e:
+        return _j({"status": "error", "reason": f"búsqueda falló: {str(e)[:160]}"})
+
+    delivered = sum(_tokens(fr["text"]) for r in results for fr in r.get("fragments", []))
+    _stats["tokens_delivered"] += delivered
+    out = {
+        "status": "results",
+        "query": params.query,
+        "root": str(root.resolve()),
+        "docs_indexed": (stats or {}).get("total_docs"),
+        "matches": len(results),
+        "tokens_delivered": delivered,
+        "results": results,
+    }
+    if stats:
+        out["index"] = {k: stats[k] for k in ("indexed", "unchanged", "removed", "took_s") if k in stats}
+    if not results:
+        out["hint"] = ("ninguna coincidencia léxica — BM25 necesita compartir palabras con el texto; "
+                       "probá otros términos o usá router_smart_read si ya sabés el archivo")
+    _rules = _rules_for_paths([str(root)])
+    if _rules:
+        out["project_rules"] = _rules
     return _j(out)
 
 

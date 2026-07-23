@@ -1,0 +1,12 @@
+{
+ "_comment": "Reglas permanentes del proyecto (claude-continuity-mcp). Editable a mano; commitealo al repo para compartirlas con el equipo.",
+ "rules": [
+  {
+   "id": 1,
+   "text": "El nucleo es 100% local y determinista: nunca resumir con LLM ni agregar dependencias de red",
+   "source_client": "code",
+   "checkpoint": "reducir-friccion-reinicio",
+   "created": "2026-07-23 19:16"
+  }
+ ]
+}

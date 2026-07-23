@@ -11,7 +11,7 @@ graph TD
     C[Claude Cowork] --> M
     D[Claude Design] --> M
 
-    M[("claude-continuity-mcp<br/>━━━━━━━━━━━━━<br/>smart_read · checkpoint · inbox<br/>rules · SQLite ledger")] --> P[(Your project<br/>on disk)]
+    M[("claude-continuity-mcp<br/>━━━━━━━━━━━━━<br/>smart_read · checkpoint · inbox<br/>project_search · rules · SQLite ledger")] --> P[(Your project<br/>on disk)]
 
     style M fill:#1a1a2e,stroke:#00c8e8,stroke-width:2px,color:#fff
     style P fill:#0d0d1a,stroke:#666,stroke-width:1px,color:#ccc
@@ -38,7 +38,7 @@ Claude is amnesiac across sessions and blind across clients: what you read in Cl
 
 > **Note:** bulk processing on free models (formerly `router_bulk_process`) was split into its own repo, [`individra-bulk-offload`](https://github.com/gabicacabelos/individra-bulk-offload), because it's a different product: it depended on external services that diluted this 100%-local core.
 
-## The 5 tools
+## The 6 tools
 
 ### `router_smart_read` — Surgical reading with memory (local, $0, no APIs)
 
@@ -115,6 +115,20 @@ And the other way around: Claude Design can leave `code` an order with the final
 
 The headline metric is `tokens_kept_out_of_context`: tokens from the original sources that **didn't** enter Claude's context window. It also reports reads, memory hits (unchanged/diff), ledger state, and pending inbox orders. `deep=true` adds local diagnostics (fastembed/python).
 
+### `router_project_search` — Search the whole project (incremental BM25)
+
+```
+project_search(project_dir="/proj", query="where are webhook signatures validated?")
+→ the most relevant files, each with its exact fragments and line numbers
+```
+
+`smart_read` answers *"where is X in **this file**?"*. The question you usually have is *"where is X **in the project**?"* — and that's where Claude falls back to Grep.
+
+- **Incremental index:** the first call indexes; later calls only re-index files whose hash changed (unchanged files cost ~0). On this repo: 23 files in 0.41s cold, **0.08s warm**.
+- **Persistent and shared:** the index lives in the ledger, so it survives across sessions and clients. Grep starts from zero every time; this doesn't.
+- **Better than literal grep for concepts:** ranks by relevance and splits `snake_case`/`camelCase`, so "webhook retry" finds `handleWebhookRetry()`.
+- Deliberately bounded: skips `node_modules`, `.git`, `dist`, binaries and files >400KB. Deterministic, 100% local — exact fragments, never summaries.
+
 ### `router_rules` — Permanent project rules, with provenance
 
 ```
@@ -149,7 +163,7 @@ pip install -r requirements.txt
 # Optional (local semantic ranking for smart_read): pip install fastembed
 ```
 
-No API key or `.env` file needed: all five tools are 100% local.
+No API key or `.env` file needed: all six tools are 100% local.
 
 ### Registering it across all your Claude sessions
 
@@ -205,6 +219,8 @@ smart_read ──▶ sanitizer (HTML/text, local) ──▶ ledger (have I seen 
 checkpoint ──▶ checkpoints/*.json (human-readable/editable) + hash verification on resume
 inbox ──────▶ shared SQLite queue (orders between Cowork/Code/Desktop/Design + handoff assets + results)
 rules ──────▶ .claude-continuity-rules.json at project root (git-friendly, provenance) → injected into smart_read/resume, optional CLAUDE.md sync
+project_search ▶ incremental BM25 index in the ledger (re-indexes only changed hashes) → files ranked + exact fragments
+hook (opt-in) ▶ PostToolUse → raw_reads staging table (WAL) → drained into the ledger by the MCP
 ```
 
 Everything local: the ledger and the inbox are SQLite files on disk; checkpoints are readable/editable JSON. No network, no API keys, no external dependencies for the core.
@@ -259,7 +275,7 @@ If `router_config.json` doesn't exist, the defaults apply (zero-config). **Logic
 ## Known limitations
 
 - BM25 is lexical: a query with no words in common with the text degrades to the first chunks of the file. Installing `fastembed` improves semantic queries (requires onnxruntime compatible with your Python version).
-- BM25 project-wide search across files isn't there yet: `smart_read` is per-file, so "where is X handled *in the project*?" still falls back to native Grep. A persistent incremental index is the natural next step.
+- BM25 is lexical, project-wide too: `router_project_search` ranks by shared vocabulary, so a query with no words in common with the code degrades. It complements Grep and semantic search, it doesn't replace them.
 - `code_staleness` detects that the code changed — it doesn't restart itself. Auto-restart isn't safe here: multiple clients may share the same process, and killing it mid-inbox-order would cut the tool out from under another session with no guarantee it comes back on its own.
 
 ## License

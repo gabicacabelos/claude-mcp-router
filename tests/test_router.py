@@ -1190,6 +1190,125 @@ def test_hook_is_silent_on_garbage_input(tmp_path):
     led.close()
 
 
+def test_project_index_is_incremental(ledger, tmp_path):
+    """Solo se re-indexa lo que cambió: lo demás cuesta ~0."""
+    from router import project_index as PI
+    proj = tmp_path / "proj"
+    (proj / "src").mkdir(parents=True)
+    (proj / "src" / "auth.py").write_text("def validar_webhook(payload): return True", encoding="utf-8")
+    (proj / "src" / "ui.py").write_text("def render_boton(): pass", encoding="utf-8")
+
+    first = PI.build_index(ledger, proj)
+    assert first["indexed"] == 2 and first["unchanged"] == 0
+
+    second = PI.build_index(ledger, proj)
+    assert second["indexed"] == 0 and second["unchanged"] == 2, "sin cambios no se re-indexa nada"
+
+    (proj / "src" / "auth.py").write_text("def validar_webhook(payload): return False", encoding="utf-8")
+    third = PI.build_index(ledger, proj)
+    assert third["indexed"] == 1 and third["unchanged"] == 1, "solo el archivo modificado"
+
+
+def test_project_index_drops_deleted_files(ledger, tmp_path):
+    from router import project_index as PI
+    proj = tmp_path / "proj2"
+    proj.mkdir()
+    (proj / "a.py").write_text("codigo a", encoding="utf-8")
+    (proj / "b.py").write_text("codigo b", encoding="utf-8")
+    PI.build_index(ledger, proj)
+
+    (proj / "b.py").unlink()
+    stats = PI.build_index(ledger, proj)
+    assert stats["removed"] == 1
+    assert stats["total_docs"] == 1
+
+
+def test_project_index_skips_noise_dirs_and_binaries(ledger, tmp_path):
+    from router import project_index as PI
+    proj = tmp_path / "proj3"
+    (proj / "node_modules" / "pkg").mkdir(parents=True)
+    (proj / ".git").mkdir()
+    proj.joinpath("node_modules", "pkg", "index.js").write_text("ruido", encoding="utf-8")
+    proj.joinpath(".git", "config.json").write_text("{}", encoding="utf-8")
+    (proj / "real.py").write_text("codigo real", encoding="utf-8")
+    (proj / "imagen.png").write_text("no indexable", encoding="utf-8")
+
+    stats = PI.build_index(ledger, proj)
+    assert stats["total_docs"] == 1, "solo real.py debe indexarse"
+
+
+def test_project_search_finds_file_by_concept(ledger, tmp_path):
+    from router import project_index as PI
+    proj = tmp_path / "proj4"
+    (proj / "src").mkdir(parents=True)
+    (proj / "src" / "webhooks.py").write_text(
+        "def validar_firma_webhook(payload, secreto):\n    '''Valida la firma HMAC del webhook entrante'''\n    return True\n",
+        encoding="utf-8")
+    (proj / "src" / "colores.py").write_text(
+        "PALETA = ['rojo', 'verde', 'azul']\ndef pintar_boton(): pass\n", encoding="utf-8")
+    PI.build_index(ledger, proj)
+
+    res = PI.search(ledger, proj, "validar firma webhook", top_k=2)
+    assert res, "debe encontrar al menos un archivo"
+    assert res[0]["file"].endswith("webhooks.py"), "el archivo relevante debe rankear primero"
+    assert res[0]["fragments"], "debe traer fragmentos exactos"
+    assert "webhook" in res[0]["fragments"][0]["text"].lower()
+
+
+def test_project_search_camel_and_snake_case_tokens(ledger, tmp_path):
+    """Ventaja sobre grep literal: entiende snake_case/camelCase."""
+    from router import project_index as PI
+    proj = tmp_path / "proj5"
+    proj.mkdir()
+    (proj / "handlers.py").write_text("def handleWebhookRetry(): pass\n", encoding="utf-8")
+    (proj / "otro.py").write_text("def cosa_distinta(): pass\n", encoding="utf-8")
+    PI.build_index(ledger, proj)
+
+    res = PI.search(ledger, proj, "webhook retry", top_k=2)
+    assert res and res[0]["file"].endswith("handlers.py")
+
+
+def test_project_search_no_match_returns_empty(ledger, tmp_path):
+    from router import project_index as PI
+    proj = tmp_path / "proj6"
+    proj.mkdir()
+    (proj / "a.py").write_text("def sumar(a, b): return a + b\n", encoding="utf-8")
+    PI.build_index(ledger, proj)
+    assert PI.search(ledger, proj, "zzzz palabra inexistente qqqq", top_k=3) == []
+
+
+def _project_search(server_module, **kw) -> dict:
+    params = server_module.ProjectSearchInput(**kw)
+    return json.loads(asyncio.run(server_module.router_project_search(params)))
+
+
+def test_router_project_search_tool_indexes_and_searches(server_module, tmp_path, monkeypatch):
+    led = FileLedger(str(tmp_path / "pi.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    proj = tmp_path / "proj7"
+    (proj / "app").mkdir(parents=True)
+    (proj / "app" / "pagos.py").write_text(
+        "def procesar_pago_tarjeta(monto):\n    '''Procesa un pago con tarjeta de credito'''\n    return monto\n",
+        encoding="utf-8")
+    (proj / "app" / "mail.py").write_text("def enviar_mail(): pass\n", encoding="utf-8")
+
+    # sin query → solo indexa
+    idx = _project_search(server_module, project_dir=str(proj))
+    assert idx["status"] == "indexed" and idx["total_docs"] == 2
+
+    r = _project_search(server_module, project_dir=str(proj), query="procesar pago con tarjeta")
+    assert r["status"] == "results"
+    assert r["matches"] >= 1
+    assert r["results"][0]["file"].endswith("pagos.py")
+    assert r["results"][0]["fragments"][0]["lines"]
+    led.close()
+
+
+def test_router_project_search_bad_dir_is_error(server_module, tmp_path):
+    r = _project_search(server_module, project_dir=str(tmp_path / "no_existe"), query="x")
+    assert r["status"] == "error"
+
+
 def test_hook_discards_silently_when_db_is_locked(tmp_path):
     """
     EL caso crítico: si el MCP tiene la DB tomada, el hook NO puede colgar la
