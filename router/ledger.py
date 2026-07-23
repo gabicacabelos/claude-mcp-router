@@ -26,6 +26,10 @@ DIFF_MAX_RATIO = 0.6           # si el diff pesa >60% del archivo, no rinde: dev
 PURGE_AFTER_DAYS = 30          # entradas sin lecturas hace >30 días se eliminan
 DB_MAX_BYTES = 100 * 1024 * 1024  # 100MB: por encima se descartan los snapshots más viejos
 
+# Versión del schema (PRAGMA user_version). Subirla cuando cambie el schema y
+# encadenar la migración correspondiente en _migrate_schema().
+LEDGER_SCHEMA_VERSION = 1
+
 
 class FileLedger:
     def __init__(self, db_path: str):
@@ -68,10 +72,29 @@ class FileLedger:
             )
         """)
         self._db.commit()
+        self._migrate_schema()
         try:
             self.purge()
         except Exception as e:
             logger.warning(f"purga del ledger falló: {e}")
+
+    def _migrate_schema(self) -> None:
+        """
+        Versionado del schema con PRAGMA user_version: si la DB es anterior al
+        código, corre las migraciones pendientes en orden antes de servir tools.
+        v0 → v1: baseline (tablas creadas arriba con IF NOT EXISTS).
+        """
+        try:
+            v = self._db.execute("PRAGMA user_version").fetchone()[0]
+            if v < LEDGER_SCHEMA_VERSION:
+                # Migraciones futuras se encadenan acá:
+                # if v < 2: self._db.execute("ALTER TABLE ...")
+                self._db.execute(f"PRAGMA user_version = {LEDGER_SCHEMA_VERSION}")
+                self._db.commit()
+                if v > 0:
+                    logger.info(f"Ledger migrado de schema v{v} a v{LEDGER_SCHEMA_VERSION}")
+        except Exception as e:
+            logger.warning(f"migración de schema del ledger falló: {e}")
 
     def purge(self) -> dict:
         """
@@ -236,6 +259,24 @@ class FileLedger:
                 continue
             state = "unchanged" if current == f.get("hash") else "changed"
             out.append({"path": f["path"], "state": state})
+        return out
+
+    def recent_files(self, limit: int = 10) -> list[dict]:
+        """
+        Últimos archivos leídos (cross-sesión/cliente), con su estado actual en
+        disco (unchanged/changed/deleted vía hash). Base del arranque en frío.
+        """
+        rows = self._db.execute(
+            "SELECT path, hash, last_seen, reads FROM file_ledger ORDER BY last_seen DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        out = []
+        for path, h, last_seen, reads in rows:
+            state = self.check_files([{"path": path, "hash": h}])[0]["state"]
+            out.append({
+                "path": path, "state": state, "reads": reads,
+                "last_seen": time.strftime("%Y-%m-%d %H:%M", time.localtime(last_seen)),
+            })
         return out
 
     def stats(self) -> dict:

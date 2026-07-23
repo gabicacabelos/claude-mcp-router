@@ -809,3 +809,119 @@ def test_stale_check_is_throttled(server_module, monkeypatch, fresh_stale_cache)
     for _ in range(10):
         server_module._stale_throttled()
     assert calls["n"] == 1, "10 llamadas dentro de la ventana deben statear archivos una sola vez"
+
+
+# ─── schema versioning (PRAGMA user_version) ──────────────────────────────────
+
+def test_ledger_fresh_db_gets_schema_version(tmp_path):
+    from router.ledger import LEDGER_SCHEMA_VERSION
+    led = FileLedger(str(tmp_path / "v.db"))
+    try:
+        assert led._db.execute("PRAGMA user_version").fetchone()[0] == LEDGER_SCHEMA_VERSION
+    finally:
+        led.close()
+
+
+def test_ledger_pre_versioning_db_is_migrated(tmp_path):
+    # DB "vieja" (schema actual pero user_version=0) → al abrir queda versionada
+    import sqlite3
+    from router.ledger import LEDGER_SCHEMA_VERSION
+    dbp = str(tmp_path / "old.db")
+    con = sqlite3.connect(dbp)
+    con.execute("CREATE TABLE file_ledger (path TEXT PRIMARY KEY, hash TEXT NOT NULL, snapshot TEXT, outline TEXT, tokens INTEGER, first_seen REAL, last_seen REAL, reads INTEGER DEFAULT 1)")
+    con.commit(); con.close()
+    led = FileLedger(dbp)
+    try:
+        assert led._db.execute("PRAGMA user_version").fetchone()[0] == LEDGER_SCHEMA_VERSION
+        led.record("/x.py", "contenido", [], tokens=1)  # y sigue operativa
+        assert led.get("/x.py") is not None
+    finally:
+        led.close()
+
+
+def test_inbox_fresh_db_gets_schema_version(tmp_path):
+    from router.inbox import INBOX_SCHEMA_VERSION
+    ib = Inbox(str(tmp_path / "vi.db"))
+    try:
+        assert ib._db.execute("PRAGMA user_version").fetchone()[0] == INBOX_SCHEMA_VERSION
+    finally:
+        ib.close()
+
+
+# ─── ledger.recent_files (base del arranque en frío) ──────────────────────────
+
+def test_ledger_recent_files_orders_and_states(ledger, tmp_path):
+    fa = tmp_path / "a.py"
+    fb = tmp_path / "b.py"
+    fa.write_text("contenido a", encoding="utf-8")
+    fb.write_text("contenido b", encoding="utf-8")
+    ledger.record(str(fa), "contenido a", [], tokens=1)
+    time.sleep(0.02)  # last_seen distinguible
+    ledger.record(str(fb), "contenido b", [], tokens=1)
+    fb.write_text("contenido b MODIFICADO", encoding="utf-8")
+
+    recent = ledger.recent_files(10)
+    assert [r["path"] for r in recent] == [str(fb), str(fa)], "orden: último leído primero"
+    states = {r["path"]: r["state"] for r in recent}
+    assert states[str(fa)] == "unchanged"
+    assert states[str(fb)] == "changed"
+
+
+# ─── server: arranque en frío (digest determinista) ───────────────────────────
+
+def _checkpoint(server_module, **kw) -> dict:
+    params = server_module.CheckpointInput(**kw)
+    return json.loads(asyncio.run(server_module.router_checkpoint(params)))
+
+
+def test_resume_without_checkpoints_returns_reconstructed_digest(
+        server_module, tmp_path, monkeypatch):
+    led = FileLedger(str(tmp_path / "dig.db"))
+    ib = Inbox(str(tmp_path / "dig_inbox.db"))
+    monkeypatch.setattr(server_module, "ledger", led)
+    monkeypatch.setattr(server_module, "inbox", ib)
+    monkeypatch.setattr(server_module, "_checkpoints_dir", tmp_path / "no_checkpoints")
+
+    f = tmp_path / "trabajado.py"
+    f.write_text("codigo", encoding="utf-8")
+    led.record(str(f), "codigo", [], tokens=2)
+    oid = ib.send("tarea vieja", to_client="code")
+    ib.complete(oid, result="hecha")
+
+    r = _checkpoint(server_module, action="resume")
+    assert r["status"] == "resumed"
+    assert r["mode"] == "reconstructed_activity", "el LLM debe saber que NO es un checkpoint intencional"
+    assert "NO un checkpoint intencional" in r["note"]
+    assert any(rf["path"] == str(f) for rf in r["recent_files"])
+    assert any(o["result"] == "hecha" for o in r["recent_orders"])
+    led.close(); ib.close()
+
+
+def test_resume_with_checkpoint_does_not_use_digest(server_module, tmp_path, monkeypatch):
+    monkeypatch.setattr(server_module, "_checkpoints_dir", tmp_path / "cps")
+    saved = _checkpoint(server_module, action="save", name="real-cp",
+                        summary="checkpoint real guardado por alguien")
+    assert saved["status"] == "saved"
+    r = _checkpoint(server_module, action="resume")
+    assert r.get("mode") is None, "habiendo checkpoint real, el digest no debe activarse"
+    assert r["summary"] == "checkpoint real guardado por alguien"
+
+
+# ─── server: MCP prompts (/resume, /handoff, /inbox) ──────────────────────────
+
+def test_prompts_exist_and_reference_the_tools(server_module):
+    r = server_module.prompt_resume()
+    assert "router_checkpoint" in r and "router_inbox" in r
+    assert "reconstructed_activity" in r, "el prompt debe advertir sobre el modo digest"
+
+    h = server_module.prompt_handoff(to="design", message="hacer el hero")
+    assert "router_checkpoint" in h and "router_inbox" in h
+    assert "'design'" in h and "hacer el hero" in h
+
+    i = server_module.prompt_inbox()
+    assert "action='check'" in i and "action='complete'" in i
+
+
+def test_prompt_handoff_without_args_asks_the_user(server_module):
+    h = server_module.prompt_handoff()
+    assert "preguntale al usuario" in h

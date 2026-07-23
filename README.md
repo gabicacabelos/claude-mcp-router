@@ -69,6 +69,8 @@ checkpoint(action="save", name="refactor-auth",
 
 When closing a long task (or when context is filling up), Claude saves the state as human-readable JSON in `checkpoints/` — editable by you, shareable with your team. A new session — on Desktop, Code, or Cowork, doesn't matter — calls `action="resume"` and recovers everything in ~300 tokens, **including which files changed on disk since the checkpoint** (hash comparison, no re-reading). `action="list"` shows the available checkpoints.
 
+**Cold start (no checkpoints saved):** `resume` never returns empty-handed. If nobody saved a checkpoint, it reconstructs a deterministic digest from the ledger and inbox — the last files touched (and whether they changed on disk since), plus recently completed orders. The payload declares `"mode": "reconstructed_activity"` explicitly: it's an activity trace, **not** an intentional checkpoint, and contains no architectural decisions.
+
 ### `router_inbox` — Cross-client orders
 
 ```
@@ -156,6 +158,18 @@ No API key or `.env` file needed: all four tools are 100% local.
 ```bash
 claude mcp add claude-continuity --scope user -- python /path/to/server.py
 ```
+
+### User-invocable prompts (slash commands)
+
+Continuity can't depend only on the model *choosing* to call these tools. The server exposes three MCP prompts that clients surface as slash commands, so **you** trigger the flow deterministically:
+
+| Prompt | What it drives |
+|---|---|
+| `/resume` | Restore the latest checkpoint (or the cold-start digest) + check pending inbox orders + brief you on where work stands |
+| `/handoff` | Save a checkpoint of this session and leave a linked order in another client's inbox (args: `to`, `message`) |
+| `/inbox` | Check this client's inbox and execute pending orders end-to-end, marking each complete with evidence |
+
+(Exact invocation varies by client — e.g. in Claude Code they appear under `/mcp__<server-name>__resume`.)
 
 ### Automatic activation
 

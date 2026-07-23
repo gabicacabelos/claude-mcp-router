@@ -103,7 +103,7 @@ _stats = {
     "diff_reads": 0,
 }
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 # Umbral: archivos por debajo se devuelven enteros (el overhead de RAG no rinde)
 FULL_RETURN_MAX_TOKENS = 1500
@@ -459,6 +459,40 @@ def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60] or "latest"
 
 
+def _cold_start_digest() -> dict:
+    """
+    Arranque en frío: no hay checkpoints, pero el ledger y el inbox SÍ tienen
+    rastro de actividad. Agregación pura desde SQLite — determinista, sin LLM.
+    `mode` lo declara explícitamente: un rastro de archivos NO es un checkpoint
+    intencional y no contiene decisiones de arquitectura.
+    """
+    try:
+        recent = ledger.recent_files(10)
+    except Exception as e:
+        logger.warning(f"digest: recent_files falló: {e}")
+        recent = []
+    try:
+        orders = inbox.history(5)
+    except Exception as e:
+        logger.warning(f"digest: inbox.history falló: {e}")
+        orders = []
+    changed = [f["path"] for f in recent if f["state"] == "changed"]
+    return {
+        "status": "resumed",
+        "mode": "reconstructed_activity",
+        "note": "no hay checkpoints guardados — esto es actividad RECONSTRUIDA del ledger/inbox "
+                "(rastro de archivos leídos y órdenes completadas), NO un checkpoint intencional: "
+                "no contiene decisiones ni contexto de tarea",
+        "recent_files": recent,
+        "recent_orders": orders,
+        "hint": (
+            f"archivos con cambios desde la última lectura: {changed} — leelos con router_smart_read para ver solo los diffs"
+            if changed else
+            "podés retomar desde los archivos recientes; guardá checkpoints al cerrar tareas para resumes con contexto real"
+        ),
+    }
+
+
 @mcp.tool(
     name="router_checkpoint",
     annotations={
@@ -527,7 +561,8 @@ async def router_checkpoint(params: CheckpointInput) -> str:
     else:
         candidates = sorted(_checkpoints_dir.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
         if not candidates:
-            return _j({"status": "empty", "reason": "no hay checkpoints guardados"})
+            # Arranque en frío: en vez de "empty", digest determinista de actividad
+            return _j(_cold_start_digest())
         path = candidates[0]
 
     try:
@@ -701,6 +736,55 @@ async def router_status(params: StatusInput) -> str:
         status["diagnostics"] = diag
 
     return _j(status)
+
+
+# ─────────────────────────────────────────────
+# MCP Prompts — flujos invocables por el USUARIO (slash commands)
+# La continuidad no puede depender solo de que el modelo elija las tools:
+# estos prompts la disparan a pedido del humano, sin azar.
+# ─────────────────────────────────────────────
+
+@mcp.prompt(name="resume", description="Retomar el trabajo previo: restaura el último checkpoint (o reconstruye la actividad reciente) y chequea órdenes pendientes")
+def prompt_resume() -> str:
+    return (
+        "Retomá el trabajo previo de este proyecto:\n"
+        "1. Llamá router_checkpoint con action='resume' (sin name, para el más reciente). "
+        "Si la respuesta trae mode='reconstructed_activity', tratála como rastro de archivos y órdenes — "
+        "NO como decisiones de arquitectura.\n"
+        "2. Llamá router_inbox con action='check' y to=<este cliente> para ver órdenes pendientes.\n"
+        "3. Resumile al usuario en 3-5 líneas: dónde quedó el trabajo, qué archivos cambiaron en disco "
+        "desde entonces, y qué órdenes hay pendientes. Cerrá proponiendo el siguiente paso concreto."
+    )
+
+
+@mcp.prompt(name="handoff", description="Cerrar la sesión con un traspaso: guarda checkpoint y deja la orden en el inbox de otro cliente")
+def prompt_handoff(to: str = "", message: str = "") -> str:
+    destino = to.strip() or "<preguntale al usuario: code, cowork, desktop o design>"
+    orden = message.strip() or "<preguntale al usuario qué tiene que hacer el receptor>"
+    return (
+        f"Cerrá esta sesión con un handoff a '{destino}':\n"
+        "1. Guardá router_checkpoint action='save' con: name corto y descriptivo, summary de lo hecho "
+        "en esta sesión, decisions tomadas, open_items pendientes y files relevantes (rutas absolutas).\n"
+        f"2. Dejá la orden con router_inbox action='send', to='{destino}', message='{orden}', "
+        "checkpoint=<el nombre que guardaste> y assets=[rutas/URLs] si hay material de handoff.\n"
+        "3. Confirmale al usuario: id de la orden, nombre del checkpoint vinculado y qué va a ver "
+        "el cliente receptor cuando arranque."
+    )
+
+
+@mcp.prompt(name="inbox", description="Chequear el inbox y ejecutar las órdenes pendientes de este cliente")
+def prompt_inbox() -> str:
+    return (
+        "Chequeá y ejecutá las órdenes del inbox:\n"
+        "1. Llamá router_inbox action='check' con to=<este cliente>.\n"
+        "2. Para cada orden pendiente: si tiene checkpoint vinculado, restauralo primero con "
+        "router_checkpoint action='resume' name=<checkpoint> para el contexto completo; revisá los assets si trae.\n"
+        "3. Ejecutá lo pedido. Ante acciones difíciles de revertir (push, borrar, publicar), verificá el "
+        "estado real antes y reportá con evidencia.\n"
+        "4. Al terminar cada orden, marcala con router_inbox action='complete', order_id y un result "
+        "detallado (hashes, conteos, rutas). Si generaste archivos, devolvelos en assets.\n"
+        "5. Cerrá con un resumen al usuario y verificá que el inbox quede sin pendientes."
+    )
 
 
 # ─────────────────────────────────────────────

@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 DONE_RETENTION_DAYS = 30
 
+# Versión del schema (PRAGMA user_version) — misma estrategia que el ledger.
+INBOX_SCHEMA_VERSION = 1
+
 # Clientes reconocidos del "pack". El inbox acepta cualquier string como
 # destino (texto libre), pero estos son los roles de primera clase que
 # los clientes chequean por convención al arrancar una sesión.
@@ -70,6 +73,17 @@ class Inbox:
                     self._db.execute(f"ALTER TABLE inbox ADD COLUMN {col} TEXT")
                 except sqlite3.OperationalError as e:
                     logger.warning(f"migración inbox ({col}) falló: {e}")
+        # Versionado con PRAGMA user_version (misma estrategia que el ledger):
+        # migraciones futuras se encadenan por número de versión.
+        try:
+            v = self._db.execute("PRAGMA user_version").fetchone()[0]
+            if v < INBOX_SCHEMA_VERSION:
+                # if v < 2: self._db.execute("ALTER TABLE ...")
+                self._db.execute(f"PRAGMA user_version = {INBOX_SCHEMA_VERSION}")
+                if v > 0:
+                    logger.info(f"Inbox migrado de schema v{v} a v{INBOX_SCHEMA_VERSION}")
+        except Exception as e:
+            logger.warning(f"migración de schema del inbox falló: {e}")
 
     @staticmethod
     def _dump_assets(assets) -> str | None:
