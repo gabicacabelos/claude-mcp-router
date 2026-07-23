@@ -9,3 +9,7 @@ aiosqlite>=0.20.0
 # Opcional — ranking semántico local (si no está, se usa BM25 puro-Python):
 # Nota: requiere onnxruntime; verificar compatibilidad con tu versión de Python.
 # pip install fastembed
+
+# Desarrollo — suite de tests (tests/test_router.py):
+# pip install pytest
+# pytest>=8.0.0
