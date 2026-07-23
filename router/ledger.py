@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 SNAPSHOT_MAX_CHARS = 400_000   # no guardar snapshots de archivos gigantes
 DIFF_MAX_RATIO = 0.6           # si el diff pesa >60% del archivo, no rinde: devolver normal
+PURGE_AFTER_DAYS = 30          # entradas sin lecturas hace >30 días se eliminan
+DB_MAX_BYTES = 100 * 1024 * 1024  # 100MB: por encima se descartan los snapshots más viejos
 
 
 class FileLedger:
@@ -42,6 +44,43 @@ class FileLedger:
             )
         """)
         self._db.commit()
+        try:
+            self.purge()
+        except Exception as e:
+            logger.warning(f"purga del ledger falló: {e}")
+
+    def purge(self) -> dict:
+        """
+        Mantenimiento automático (corre al iniciar el servidor):
+        1. Elimina entradas sin lecturas hace > PURGE_AFTER_DAYS
+        2. Si la DB supera DB_MAX_BYTES, vacía los snapshots más antiguos
+           (se conserva hash+outline: 'unchanged' sigue funcionando, solo se pierde el diff)
+        """
+        cutoff = time.time() - PURGE_AFTER_DAYS * 86400
+        cur = self._db.execute("DELETE FROM file_ledger WHERE last_seen < ?", (cutoff,))
+        expired = cur.rowcount
+        self._db.commit()
+
+        snapshots_dropped = 0
+        db_size = Path(self.db_path).stat().st_size if Path(self.db_path).exists() else 0
+        if db_size > DB_MAX_BYTES:
+            rows = self._db.execute(
+                "SELECT path, LENGTH(snapshot) FROM file_ledger WHERE snapshot IS NOT NULL ORDER BY last_seen ASC"
+            ).fetchall()
+            to_free = db_size - int(DB_MAX_BYTES * 0.8)  # bajar al 80% del límite
+            freed = 0
+            for path, size in rows:
+                if freed >= to_free:
+                    break
+                self._db.execute("UPDATE file_ledger SET snapshot=NULL WHERE path=?", (path,))
+                freed += size or 0
+                snapshots_dropped += 1
+            self._db.commit()
+            self._db.execute("VACUUM")
+
+        if expired or snapshots_dropped:
+            logger.info(f"Ledger: {expired} entradas expiradas, {snapshots_dropped} snapshots liberados")
+        return {"expired": expired, "snapshots_dropped": snapshots_dropped}
 
     @staticmethod
     def hash(content: str) -> str:
@@ -125,7 +164,8 @@ class FileLedger:
         row = self._db.execute(
             "SELECT COUNT(*), COALESCE(SUM(reads),0), COALESCE(SUM(tokens),0) FROM file_ledger"
         ).fetchone()
-        return {"files_tracked": row[0], "total_reads": row[1], "tokens_tracked": row[2]}
+        size_kb = round(Path(self.db_path).stat().st_size / 1024, 1) if Path(self.db_path).exists() else 0
+        return {"files_tracked": row[0], "total_reads": row[1], "tokens_tracked": row[2], "db_size_kb": size_kb}
 
     def close(self) -> None:
         self._db.close()
