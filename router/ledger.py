@@ -36,6 +36,14 @@ class FileLedger:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path)
+        # WAL: el hook de captura pasiva escribe desde OTRO proceso mientras el
+        # MCP lee/escribe. Sin WAL eso da 'database is locked'; con WAL, lectores
+        # y un escritor conviven. busy_timeout acota la espera en vez de colgar.
+        try:
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA busy_timeout=3000")
+        except Exception as e:
+            logger.warning(f"no se pudo activar WAL: {e}")
         self._db.execute("""
             CREATE TABLE IF NOT EXISTS file_ledger (
                 path TEXT PRIMARY KEY,
@@ -69,6 +77,17 @@ class FileLedger:
                 chunk_idx INTEGER NOT NULL,
                 vector BLOB NOT NULL,
                 PRIMARY KEY (file_hash, chunk_idx)
+            )
+        """)
+        # Tabla de paso de la captura pasiva: el hook hace UN insert y se va.
+        # Deliberadamente tonta (sin hash ni snapshot) para que el hook termine
+        # en microsegundos; el MCP la promueve al ledger real cuando le conviene.
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS raw_reads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                client TEXT,
+                seen_at REAL NOT NULL
             )
         """)
         self._db.commit()
@@ -260,6 +279,45 @@ class FileLedger:
             state = "unchanged" if current == f.get("hash") else "changed"
             out.append({"path": f["path"], "state": state})
         return out
+
+    # ─── Captura pasiva (hooks) ───────────────────────────────────────────────
+
+    def drain_raw_reads(self, limit: int = 200) -> int:
+        """
+        Promueve lo que el hook dejó en raw_reads al ledger real: lee el archivo,
+        calcula hash/outline y lo registra. Corre del lado del MCP (no del hook),
+        así el hook nunca paga este costo. Devuelve cuántos se promovieron.
+
+        Los paths que ya no existen o no se pueden leer se descartan igual (la
+        fila se consume) para que la tabla de paso no crezca sin límite.
+        """
+        rows = self._db.execute(
+            "SELECT id, path FROM raw_reads ORDER BY id LIMIT ?", (limit,)
+        ).fetchall()
+        if not rows:
+            return 0
+        promoted, consumed = 0, []
+        for rid, path in rows:
+            consumed.append(rid)
+            try:
+                p = Path(path)
+                if not p.is_file():
+                    continue
+                content = p.read_text(encoding="utf-8", errors="replace")
+                if self.get(path) and self.get(path)["hash"] == self.hash(content):
+                    self.touch(path)  # ya conocido y sin cambios: solo actualizar
+                    promoted += 1
+                    continue
+                self.record(path, content, [], len(content) // 4)
+                promoted += 1
+            except Exception as e:
+                logger.debug(f"drain: descartando {path}: {e}")
+        self._db.executemany("DELETE FROM raw_reads WHERE id=?", [(i,) for i in consumed])
+        self._db.commit()
+        return promoted
+
+    def pending_raw_reads(self) -> int:
+        return self._db.execute("SELECT COUNT(*) FROM raw_reads").fetchone()[0]
 
     def recent_files(self, limit: int = 10) -> list[dict]:
         """

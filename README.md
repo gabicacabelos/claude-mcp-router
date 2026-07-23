@@ -215,6 +215,34 @@ Each client launches `server.py` as its own process and keeps it alive for the d
 
 So you don't have to infer that by hand, `router_status` includes `code_staleness`: it compares the modification time of `server.py`/`router/*.py` against when the process started, and returns `{"stale": true, "changed_file": "...", "hint": "..."}` if the disk changed after boot. Additionally, when there's staleness, **every** tool injects a `code_stale` field into its response (with the changed file and a hint) — you find out on the very first call you make, without needing to remember to check `router_status`. In normal operation the field doesn't exist: it only appears if the code actually changed on disk after boot.
 
+## Passive capture (optional, Claude Code only)
+
+The memory only fills up when Claude *chooses* `router_smart_read`. If it uses its native `Read` instead, the ledger never finds out. An opt-in `PostToolUse` hook closes that gap: **value accumulates even when Claude never picks this MCP's tools.**
+
+Add to your `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [{ "type": "command", "command": "python /path/to/claude-continuity-mcp/hooks/capture_read.py" }]
+      }
+    ]
+  }
+}
+```
+
+The hook is deliberately dumb: it does **one** INSERT into a staging table (`raw_reads`) and exits — no hashing, no file reading. The MCP later promotes those rows into the real ledger on its own time (`drain_raw_reads`), so the hook never pays that cost. The ledger runs in **WAL** mode so the hook (a separate process) and the MCP can write concurrently.
+
+**Honest costs and caveats:**
+
+- **~250ms per native `Read`**, almost entirely Python interpreter startup — not the DB write. If you read a lot of files, that adds up. Don't enable it if that bothers you; everything else works without it.
+- If the DB is busy, the hook **discards the capture silently** (100ms SQLite timeout). Losing a capture is free; freezing your terminal is not.
+- **Claude Code only.** Desktop/Cowork/Design have no hooks — there, memory still depends on the tools being called.
+- It's coupling to an Anthropic-controlled API that can change. That's why it's opt-in and strictly additive: if the hook stops firing, nothing breaks.
+
 ## Hot configuration (`router_config.json`)
 
 Runtime tunables can be adjusted **without restarting the MCP**. Copy `router_config.example.json` to `router_config.json` (next to `server.py`, gitignored) and edit what you need — the next call to any tool picks it up (the file is only re-parsed when its modification time changes, near-zero overhead):

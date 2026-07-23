@@ -13,7 +13,11 @@ Todas las DBs usan tmp_path de pytest. Cero red, cero side-effects fuera del tmp
 import asyncio
 import importlib.util
 import json
+import os
+import sqlite3
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1094,4 +1098,121 @@ def test_smart_read_omits_project_rules_when_none(server_module, tmp_path, monke
 
     r = _smart_read(server_module, file_path=str(f))
     assert "project_rules" not in r, "sin reglas, el campo no debe existir (disciplina de tokens)"
+    led.close()
+
+
+# ─── captura pasiva: WAL, tabla de paso y drain ───────────────────────────────
+
+def test_ledger_uses_wal_journal(ledger):
+    """WAL es precondición: el hook escribe desde otro proceso mientras el MCP opera."""
+    mode = ledger._db.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "wal"
+
+
+def test_drain_promotes_raw_reads_to_ledger(ledger, tmp_path):
+    f = tmp_path / "leido_por_hook.py"
+    f.write_text("print('capturado')", encoding="utf-8")
+    ledger._db.execute("INSERT INTO raw_reads (path, client, seen_at) VALUES (?,?,?)",
+                       (str(f), "code", time.time()))
+    ledger._db.commit()
+    assert ledger.pending_raw_reads() == 1
+    assert ledger.get(str(f)) is None
+
+    assert ledger.drain_raw_reads() == 1
+    assert ledger.pending_raw_reads() == 0, "la fila se consume"
+    entry = ledger.get(str(f))
+    assert entry is not None and entry["hash"] == FileLedger.hash("print('capturado')")
+
+
+def test_drain_discards_unreadable_paths_without_growing_table(ledger, tmp_path):
+    ledger._db.execute("INSERT INTO raw_reads (path, client, seen_at) VALUES (?,?,?)",
+                       (str(tmp_path / "no_existe.py"), "code", time.time()))
+    ledger._db.commit()
+    assert ledger.drain_raw_reads() == 0, "un path muerto no se promueve"
+    assert ledger.pending_raw_reads() == 0, "pero la fila se consume igual (tabla acotada)"
+
+
+def test_drain_on_empty_table_is_noop(ledger):
+    assert ledger.drain_raw_reads() == 0
+
+
+# ─── el hook: rápido, silencioso y no-bloqueante ──────────────────────────────
+
+def _run_hook(payload: dict, db_path, monkeypatch_env=None):
+    """Corre el script del hook como subproceso real, con su stdin JSON."""
+    import subprocess
+    hook = Path(__file__).parent.parent / "hooks" / "capture_read.py"
+    env = dict(os.environ)
+    if monkeypatch_env:
+        env.update(monkeypatch_env)
+    src = hook.read_text(encoding="utf-8").replace(
+        'DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "ledger.db"',
+        f'DB_PATH = Path(r"{db_path}")',
+    )
+    tmp_hook = Path(db_path).parent / "_hook_under_test.py"
+    tmp_hook.write_text(src, encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, str(tmp_hook)], input=json.dumps(payload),
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+
+
+def test_hook_inserts_raw_read(tmp_path):
+    db = tmp_path / "ledger.db"
+    led = FileLedger(str(db))
+    f = tmp_path / "archivo.py"
+    f.write_text("x = 1", encoding="utf-8")
+
+    proc = _run_hook({"tool_name": "Read", "tool_input": {"file_path": str(f)}}, db)
+    assert proc.returncode == 0
+    assert proc.stdout == "" and proc.stderr == "", "el hook no debe ensuciar la terminal"
+    assert led.pending_raw_reads() == 1
+    led.close()
+
+
+def test_hook_is_silent_on_garbage_input(tmp_path):
+    db = tmp_path / "ledger.db"
+    led = FileLedger(str(db))
+    import subprocess
+    hook = Path(__file__).parent.parent / "hooks" / "capture_read.py"
+    src = hook.read_text(encoding="utf-8").replace(
+        'DB_PATH = Path(__file__).resolve().parent.parent / "cache" / "ledger.db"',
+        f'DB_PATH = Path(r"{db}")',
+    )
+    tmp_hook = tmp_path / "_hook_garbage.py"
+    tmp_hook.write_text(src, encoding="utf-8")
+    for bad in ("", "{no es json", '{"tool_input":{}}'):
+        proc = subprocess.run([sys.executable, str(tmp_hook)], input=bad,
+                              capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, f"entrada {bad!r} no debe romper el flujo del usuario"
+        assert proc.stderr == ""
+    assert led.pending_raw_reads() == 0
+    led.close()
+
+
+def test_hook_discards_silently_when_db_is_locked(tmp_path):
+    """
+    EL caso crítico: si el MCP tiene la DB tomada, el hook NO puede colgar la
+    terminal — descarta la captura en silencio y sale rápido.
+    """
+    db = tmp_path / "ledger.db"
+    led = FileLedger(str(db))
+    f = tmp_path / "archivo.py"
+    f.write_text("x = 1", encoding="utf-8")
+
+    # Bloqueo exclusivo desde otra conexión (simula al MCP escribiendo)
+    blocker = sqlite3.connect(str(db), isolation_level="EXCLUSIVE")
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        t0 = time.time()
+        proc = _run_hook({"tool_name": "Read", "tool_input": {"file_path": str(f)}}, db)
+        elapsed = time.time() - t0
+        assert proc.returncode == 0, "con la DB bloqueada el hook igual debe salir limpio"
+        assert proc.stderr == "", "no debe escupir errores a la terminal"
+        # Presupuesto generoso para el arranque del intérprete; lo que se valida
+        # es que NO se queda esperando el lock indefinidamente.
+        assert elapsed < 15, f"el hook no debe colgarse esperando el lock (tardó {elapsed:.1f}s)"
+    finally:
+        blocker.rollback()
+        blocker.close()
     led.close()

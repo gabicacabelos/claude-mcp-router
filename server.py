@@ -329,6 +329,12 @@ async def router_smart_read(params: SmartReadInput) -> str:
     - HTML: se limpia localmente (scripts/tags fuera) antes de procesar.
     """
     cfg = _load_config()
+    # Promueve lo que el hook de captura pasiva haya dejado en la tabla de paso.
+    # El costo lo paga el MCP acá, nunca el hook (que corre en la terminal).
+    try:
+        ledger.drain_raw_reads()
+    except Exception as e:
+        logger.warning(f"drain de captura pasiva falló: {e}")
     fp = Path(params.file_path)
     if not fp.exists() or not fp.is_file():
         return _j({"status": "error", "reason": f"no existe: {params.file_path}"})
@@ -495,6 +501,10 @@ def _cold_start_digest() -> dict:
     `mode` lo declara explícitamente: un rastro de archivos NO es un checkpoint
     intencional y no contiene decisiones de arquitectura.
     """
+    try:
+        ledger.drain_raw_reads()  # el digest en frío se nutre también de lo capturado pasivamente
+    except Exception as e:
+        logger.warning(f"digest: drain falló: {e}")
     try:
         recent = ledger.recent_files(10)
     except Exception as e:
@@ -761,6 +771,12 @@ async def router_status(params: StatusInput) -> str:
         "inbox_pending": len(inbox.check()),
         "code_staleness": _code_staleness(_stats["start_time"]),
     }
+    try:
+        pending_raw = ledger.pending_raw_reads()
+        if pending_raw:
+            status["passive_capture_pending"] = pending_raw
+    except Exception:
+        pass
 
     if params.deep:
         diag = {}
